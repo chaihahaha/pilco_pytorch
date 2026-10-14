@@ -228,3 +228,49 @@ A scenario needs `spec: StateSpec`, `cost`, `initial_state()`,
 `optimisation_state()`, `step_true()`, `rollout_true()` and
 `data_from_rollout()`.  See `scenarios/mountaincar.py` for a minimal example
 (the loop in `pilco.py` is entirely scenario-agnostic).
+
+---
+
+## 8. Known gap: the closed loop does not yet match the reference
+
+The model layer is validated; the learning loop is not at parity on cart-pole,
+and it is worth recording precisely what is and is not known.
+
+**What matches.**  All operators, the planner, the value and its gradient agree
+with the NumPy reference (see the validation table in `README.md`).  On
+*identical* data and an identical starting policy the policy optimiser is
+comparable: NumPy `minimize` reaches `J = 32.37` in 151 line searches, torch
+L-BFGS reaches `J = 33.34` in 187 evaluations
+(`scripts/diagnostics/optimiser_parity.py`).
+
+**What does not.**  The closed loop reaches 19–38 per `H = 40` cart-pole
+episode depending on settings, against the reference's ≈ 9 after one learning
+episode, with high seed variance.
+
+**Diagnosis.**  The divergence is in GP hyper-parameter training.
+
+| measurement | value |
+| --- | --- |
+| negative log marginal likelihood reached by NumPy `minimize` (40 points) | `+51.3` |
+| ... reached by unconstrained torch L-BFGS from the same start | `−25.4` |
+| noise standard deviation at the torch optimum | ~`1e-4` (it fits sampled process noise) |
+| closed-loop episode costs, 30 GP iterations | `[35.0, 36.3, 19.2]` (learning) |
+| closed-loop episode costs, 150 GP iterations | `[40.0, 37.7, 29.4]` (not learning) |
+
+With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,
+plus 4 signal and 4 noise parameters) more optimisation is *worse*.  PILCO's
+weaker MATLAB-style `minimize` accidentally regularises; the faithfully
+implemented curb is a sharp `p = 30` penalty that only bites at ~100× deviations
+and is negligible in the relevant range.
+
+**Why this is a documentation-worthy state rather than a footnote.**  It is the
+same failure mode as the directed-exploration problem: the closed-loop result is
+dominated by how much the *model* is trusted, not by the planner's algebra.  Any
+DE comparison run on top of an overconfident dynamics model will be measuring
+that, not the exploration objective.
+
+**Next steps.**  (1) Match PILCO's `minimize` convergence behaviour (bounded
+line searches or NLML-based early stopping) rather than maximising the marginal
+likelihood; (2) reduce the hyper-parameter count per output until data ≫
+parameters; (3) instrument the closed loop episode-by-episode against the
+reference on a shared dataset.
