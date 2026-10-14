@@ -247,15 +247,37 @@ L-BFGS reaches `J = 33.34` in 187 evaluations
 episode depending on settings, against the reference's ≈ 9 after one learning
 episode, with high seed variance.
 
-**Diagnosis.**  The divergence is in GP hyper-parameter training.
+**Diagnosis, stage 1 — the dynamics fit.**  `scripts/diagnostics/gp_fit_effect.py`
+holds the policy optimiser, the starting controller and the 40-point dataset
+fixed and varies only the GP fit:
 
-| measurement | value |
-| --- | --- |
-| negative log marginal likelihood reached by NumPy `minimize` (40 points) | `+51.3` |
-| ... reached by unconstrained torch L-BFGS from the same start | `−25.4` |
-| noise standard deviation at the torch optimum | ~`1e-4` (it fits sampled process noise) |
-| closed-loop episode costs, 30 GP iterations | `[35.0, 36.3, 19.2]` (learning) |
-| closed-loop episode costs, 150 GP iterations | `[40.0, 37.7, 29.4]` (not learning) |
+| variant | GP NLML | policy J after the same optimiser |
+| --- | --- | --- |
+| A. hyper-parameters from NumPy `minimize` | `+51.3` | **33.85** |
+| B. torch L-BFGS, 150 iterations | `−17.6` | 35.80 |
+| C. torch L-BFGS, 30 iterations | `−17.9` | 35.95 |
+| D. torch L-BFGS, 150 iterations, ARD lengthscales shared across outputs | `+3.7` | 38.29 |
+
+So the GP fit *is* a real effect (≈ 2 points, 5.8%), but it does **not** by itself
+explain the closed-loop gap (reference ≈ 9 vs ours 19–38).  Note also that
+reducing the hyper-parameter count (D) makes things worse, so "fewer parameters"
+is not the fix, and B ≈ C shows that early stopping is not either: the torch
+optimum is simply a different, less useful fit than NumPy's.
+
+**Diagnosis, stage 2 — everything else checks out.**  The scenario plumbing was
+verified against the reference: `CartPole.policy_numpy` reproduces
+`conCat(congp, gSat)` to 5.4e-6, and the planner value/gradient agree as in the
+validation table.  (An apparent trajectory mismatch turned out to be my own test
+using `np.random.default_rng` where the reference uses `np.random.seed` — a
+different noise stream, not a bug.)
+
+**Conclusion so far.**  The remaining gap looks like *amplified sensitivity*
+rather than one more defect: cart-pole swing-up is a narrow optimum reached by a
+particular closed-loop trajectory, and any difference — in the GP fit, in the
+noise stream, in the optimiser's line search — moves the loop into a different
+basin.  Supporting evidence: with `gp_iterations=30` the loop does improve over
+episodes (`[35.0, 36.3, 19.2]`) but needs more episodes than the reference's one.
+
 
 With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,
 plus 4 signal and 4 noise parameters) more optimisation is *worse*.  PILCO's

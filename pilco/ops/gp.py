@@ -96,7 +96,8 @@ class GpDynamicsOp(MomentOp):
     def __init__(self, inputs: torch.Tensor, targets: torch.Tensor,
                  lengthscales: torch.Tensor, signal: torch.Tensor,
                  noise: torch.Tensor,
-                 individual_noise: Optional[torch.Tensor] = None):
+                 individual_noise: Optional[torch.Tensor] = None,
+                 share_lengthscales: bool = False):
         super().__init__()
         inputs = torch.as_tensor(inputs)
         targets = torch.as_tensor(targets)
@@ -116,6 +117,14 @@ class GpDynamicsOp(MomentOp):
             noi = noi.expand(E).clone()
 
         self.n_in, self.n_out = d, E
+        #: When true, one ARD lengthscale per input dimension is shared by all
+        #: outputs, halving-ish the hyper-parameter count.  PILCO uses one per
+        #: (input, output) pair, which is 24 parameters for cart-pole's 6 inputs
+        #: and 4 outputs -- more than the number of data points in the first
+        #: episodes.  See ``docs/ARCHITECTURE.md`` section 8.
+        self.share_lengthscales = bool(share_lengthscales)
+        if self.share_lengthscales:
+            ell = ell[:, :1]
         self.register_buffer("inputs", inputs.clone())
         self.register_buffer("targets", targets.clone())
         self.log_lengthscales = nn.Parameter(torch.log(ell.clone()))
@@ -130,7 +139,8 @@ class GpDynamicsOp(MomentOp):
     @classmethod
     def from_log_hyp(cls, inputs: torch.Tensor, targets: torch.Tensor,
                      log_hyp: torch.Tensor,
-                     individual_noise: Optional[torch.Tensor] = None) -> "GpDynamicsOp":
+                     individual_noise: Optional[torch.Tensor] = None,
+                     share_lengthscales: bool = False) -> "GpDynamicsOp":
         """Build from PILCO's hyper-parameter layout ``(d + 2, E)``.
 
         Rows ``0..d-1`` are log lengthscales, row ``d`` is the log signal
@@ -140,14 +150,24 @@ class GpDynamicsOp(MomentOp):
         d = log_hyp.shape[0] - 2
         return cls(inputs, targets, torch.exp(log_hyp[:d]),
                    torch.exp(log_hyp[d]), torch.exp(log_hyp[d + 1]),
-                   individual_noise=individual_noise)
+                   individual_noise=individual_noise,
+                   share_lengthscales=share_lengthscales)
 
     def log_hyp(self) -> torch.Tensor:
         """The hyper-parameters in PILCO's ``(d + 2, E)`` layout."""
-        return torch.cat([self.log_lengthscales, self.log_signal[None, :],
+        ell = self.log_lengthscales
+        if self.share_lengthscales:
+            ell = ell.expand(self.n_in, self.n_out)
+        return torch.cat([ell, self.log_signal[None, :],
                           self.log_noise[None, :]], dim=0)
 
     # ------------------------------------------------------------------
+    def _log_ell(self, e: int) -> torch.Tensor:
+        """Log lengthscales used for output ``e`` (shared or per-output)."""
+        if self.share_lengthscales:
+            return self.log_lengthscales[:, 0]
+        return self.log_lengthscales[:, e]
+
     @property
     def lengthscales(self) -> torch.Tensor:
         return torch.exp(self.log_lengthscales)
@@ -162,7 +182,7 @@ class GpDynamicsOp(MomentOp):
 
     def kernel(self, a: torch.Tensor, b: torch.Tensor, e: int) -> torch.Tensor:
         """``k_e`` between rows of ``a`` and ``b``."""
-        iell = torch.exp(-self.log_lengthscales[:, e])
+        iell = torch.exp(-self._log_ell(e))
         dist = ((a[:, None, :] - b[None, :, :]) * iell) ** 2
         return (self.signal[e] ** 2) * torch.exp(-0.5 * dist.sum(-1))
 
@@ -245,7 +265,7 @@ class GpDynamicsOp(MomentOp):
 
         ell_cols, k_cols, iell_cols, B_cols = [], [], [], []
         for e in range(E):
-            iell = torch.exp(-self.log_lengthscales[:, e])
+            iell = torch.exp(-self._log_ell(e))
             B = eye + (iell[:, None] * iell[None, :]) * cov
             ytilde = (mean[None, :] - self.inputs) * iell
             sol = torch.linalg.solve(B, ytilde.transpose(0, 1)).transpose(0, 1)
