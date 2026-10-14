@@ -1,0 +1,128 @@
+# `pilco_pytorch`
+
+A PyTorch re-implementation of PILCO (Deisenroth & Rasmussen 2011) in which
+every nonlinearity and every Gaussian moment propagation is a small,
+composable, autograd-differentiable module — plus closed-form directed
+exploration objectives on top of it.
+
+The design argument is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the
+directed-exploration design (and the diagnosis of why it does not help on
+cart-pole) is in [`docs/DIRECTED_EXPLORATION.md`](docs/DIRECTED_EXPLORATION.md)
+and in the repository-level [`reports/ANALYSIS.md`](../reports/ANALYSIS.md).
+
+---
+
+## The idea in one paragraph
+
+PILCO's analytic machinery is one pattern repeated: given `x ~ N(m, S)`, report
+`E[g(x)]`, `Cov[g(x)]` and `C = S⁻¹ Cov[x, g(x)]`.  The NumPy port
+(`../pilco_python`) implements that pattern *and* hand-derives all nine
+Jacobians (`dMdm, dSdm, dVdm, dMds, dSds, dVds, dMdp, dSdp, dCdp`) for every
+operator, in MATLAB's column-major `vec` convention — over half the code base,
+and the source of most bugs.  Here an operator only implements the **forward**
+moments; autograd produces every derivative, including second-order ones.
+
+```python
+class MomentOp(nn.Module):
+    n_in: int
+    n_out: int
+    def moments(self, mean, cov) -> Moments: ...   # E[g], Cov[g], C
+```
+
+`splice()` then attaches an operator's output to an augmented Gaussian in ten
+lines — replacing `base/propagated.py::_fill_in` and its Fortran index
+bookkeeping.
+
+---
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+
+# validate the operators against the NumPy reference (machine precision)
+python tests/test_ops_vs_numpy.py
+python tests/test_joint.py
+
+# validate the whole planner + gradients against the NumPy reference
+python tests/test_end_to_end_vs_numpy.py
+
+# learn cart-pole
+python scripts/run_cartpole.py --episodes 6 --seed 0
+
+# compare PILCO against the closed-form exploration objectives
+python scripts/benchmark_exploration.py --env cartpole --episodes 5 --seeds 0 1 2
+python scripts/benchmark_exploration.py --env mountaincar --episodes 4 --horizon 120
+```
+
+Library use:
+
+```python
+import torch
+from pilco.scenarios.cartpole import make_cartpole
+from pilco.pilco import PilcoConfig, learn
+from pilco.objectives import ExplorationObjective
+
+torch.set_default_dtype(torch.float64)
+scenario = make_cartpole()
+config = PilcoConfig(
+    horizon=40, episodes=6, seed=0,
+    objective=ExplorationObjective(kind="gittins"))   # or "ucb", "mean"
+model, logs = learn(scenario, config)
+```
+
+---
+
+## Layout
+
+```
+pilco/
+  gaussian.py    Gaussian container + safe linear algebra
+  ops/           moment operators
+    base.py        MomentOp, Moments, splice, AffineOp
+    fourier.py     sin/cos harmonics  (replaces gTrig + gSin + gSat)
+    policy.py      RBF controller     (replaces congp + gp2)
+    gp.py          ARD SE GP dynamics (replaces gp0d)
+    cost.py        saturating cost    (replaces lossSat / loss_cp)
+    joint.py       joint trig augmentation of two correlated states
+  trajectory.py  StateSpec, PilcoModel, plan()
+  objectives.py  value, cumulative-cost variance, information gain, acquisitions
+  models/gp.py   L-BFGS hyper-parameter training (replaces train + hypCurb)
+  pilco.py       the learning loop
+  scenarios/     cartpole.py, mountaincar.py
+```
+
+## Validation
+
+| check | result |
+| --- | --- |
+| `TrigAugmentOp` vs `util/gTrig.py` | exact (0, 6e-17, 0) |
+| `SaturationOp` vs `util/gSat.py` | exact (6e-17, 4e-16, 6e-17) |
+| `GpDynamicsOp` vs `gp/gp0d.py` | 3e-11 / 8e-12 / 3e-11 |
+| `SaturatingCostOp` vs `loss/lossSat.py` | 0 / 1.7e-18 |
+| cost cross-moment vs Monte Carlo | 1.7e-4 |
+| autograd vs finite differences | 3e-10 |
+| `plan().value()` vs `base/value.py` | 1.2e-6 absolute on 39.8 |
+| autograd gradient vs `base/value.py` analytic `dJ/dp` | 5.6e-6 relative |
+| mean Jacobian (`jacfwd` vs `jvp`) | 4.6e-13 |
+| cumulative-cost variance vs joint-Gaussian MC | 4.8e-2 relative |
+
+## Directed exploration
+
+`objectives.ExplorationObjective` selects among
+
+* `mean` — plain PILCO,
+* `ucb` — `E[C] − β·sd[C]`,
+* `gittins` — `E[C] + λ'_γ·sd[C]`, `λ'` from McAllister eq. (4.16),
+* `info_weight > 0` — adds `−w ·` closed-form GP information gain
+  (`0.5 Σ_e log det(I + σ_e⁻² K̄_e)`, normalised so that it measures the
+  non-redundancy of the visited inputs).
+
+Unlike `pilco_python`, the exploration term is **differentiated** and optimised
+by the same L-BFGS call as the cost.  See `docs/DIRECTED_EXPLORATION.md`.
+
+## Requirements
+
+Python ≥ 3.10, `torch ≥ 2.0` (for `torch.func`), `numpy`, `scipy` (only for the
+true-environment ODE in the cart-pole scenario).  The reference-validation tests
+additionally need `../pilco_python` on the path.

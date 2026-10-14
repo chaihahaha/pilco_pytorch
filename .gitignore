@@ -1,0 +1,28 @@
+# 临时与生成物
+/tmp/
+/logs/
+/results/
+/cache/
+/outputs/
+/reports/
+/build/
+/dist/
+/envs/
+
+# 大文件 / 模型
+/models/
+/weights/
+/ckpts/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.onnx
+
+# 系统与编辑器
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
