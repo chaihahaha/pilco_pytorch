@@ -105,7 +105,44 @@ pilco/
 | `plan().value()` vs `base/value.py` | 1.2e-6 absolute on 39.8 |
 | autograd gradient vs `base/value.py` analytic `dJ/dp` | 5.6e-6 relative |
 | mean Jacobian (`jacfwd` vs `jvp`) | 4.6e-13 |
+| `augmented_joint` vs MC (in standard-error units) | ≤ 3.6σ over 3e6 samples |
 | cumulative-cost variance vs joint-Gaussian MC | 4.8e-2 relative |
+
+## Status and a known limitation
+
+**The model layer is done and validated; the learning loop is not yet at parity.**
+
+* All operators, the planner, the value and its gradient match the NumPy
+  reference (table above).  On *identical* data and an identical starting policy
+  the policy optimiser is comparable too: NumPy `minimize` reaches `J = 32.37`
+  in 151 line searches, torch L-BFGS reaches `J = 33.34` in 187 evaluations.
+* The closed loop nevertheless does **not** reproducibly reproduce the reference's
+  cart-pole performance (reference: ≈ 9 per `H = 40` episode after one learning
+  episode; here: 19–38 depending on settings, with high seed variance).
+
+Diagnosis so far (`scripts/diagnostics/optimiser_parity.py` and the experiments
+in `docs/ARCHITECTURE.md` §8): the divergence is in **GP hyper-parameter
+training**, not in the planner.
+
+* On the same 40-point dataset, the NumPy trainer stops at a negative log
+  marginal likelihood of `+51.3`, while unconstrained L-BFGS reaches `−25.4`
+  from the same starting point (it drives the noise standard deviation to
+  ~1e-4, i.e. it fits the sampled process noise).
+* That overconfident model then misleads policy search.  Measured closed-loop
+  effect on cart-pole: **30 GP iterations → episode costs `[35.0, 36.3, 19.2]`**
+  (learning), **150 iterations → `[40.0, 37.7, 29.4]`** (not learning).
+  With ≤ 80 data points and 32 GP hyper-parameters, more optimisation is worse.
+  PILCO's weak MATLAB-style `minimize` accidentally regularises; the faithful
+  curb is a sharp penalty at ~100x deviations and does not bite in the relevant
+  range.
+* The default `gp_iterations` is therefore set to 50 with this reasoning
+  documented in `pilco.py`, but that is a workaround, not a fix.
+
+Concrete next steps, in order: (1) match PILCO's `minimize` convergence more
+closely (bounded line searches / early stopping on the NLML, which is the
+behaviour the reference actually exhibits); (2) reduce the hyper-parameter count
+per output or share lengthscales until there are ≫ data points; (3) instrument
+the closed loop episode-by-episode against the reference on a *shared* dataset.
 
 ## Directed exploration
 

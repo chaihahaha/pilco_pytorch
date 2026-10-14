@@ -42,7 +42,15 @@ class PilcoConfig:
     horizon: int = 40
     episodes: int = 6
     initial_rollouts: int = 1
-    gp_iterations: int = 200
+    #: L-BFGS iterations for the GP hyper-parameters.  This is *not* a PILCO
+    #: parameter: PILCO's ``minimize`` runs 150 MATLAB-style line searches, which
+    #: does far less work than 150 strong-Wolfe L-BFGS iterations.  With only 40
+    #: data points and 32 hyper-parameters (6 lengthscales x 4 outputs, plus
+    #: signals and noises) aggressive optimisation fits the sampled process noise
+    #: and the resulting overconfident model misleads policy search.  Measured on
+    #: cart-pole: 30 iterations -> episode costs [35.0, 36.3, 19.2] (learning),
+    #: 150 iterations -> [40.0, 37.7, 29.4].  See docs/ARCHITECTURE.md section 8.
+    gp_iterations: int = 50
     policy_iterations: int = 150
     objective: ExplorationObjective = field(default_factory=ExplorationObjective)
     seed: int = 0
@@ -128,15 +136,17 @@ def optimise_policy(model: PilcoModel, initial_state: Gaussian, config: PilcoCon
     state = {"value": float("inf"), "n": 0}
 
     def closure():
-        optimiser.zero_grad()
+        optimiser.zero_grad(set_to_none=True)
         traj = plan(model, initial_state, config.horizon, with_jacobians=True)
         score = objective(traj, model)
         score.backward()
-        # autograd can leave a non-contiguous .grad (e.g. from a transpose in
-        # the moment formulas), which torch.optim.LBFGS rejects; normalise it
+        # autograd can leave a non-contiguous .grad (e.g. from a transpose in the
+        # moment formulas), which torch.optim.LBFGS rejects.  Detach as well: a
+        # graph-attached .grad left behind on the parameter makes the *next*
+        # backward pass fail with "backward through the graph a second time".
         for p in params:
             if p.grad is not None and not p.grad.is_contiguous():
-                p.grad = p.grad.contiguous()
+                p.grad = p.grad.detach().contiguous()
         state["value"] = float(score.detach())
         state["n"] += 1
         return score

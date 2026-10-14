@@ -180,9 +180,25 @@ class GpDynamicsOp(MomentOp):
         """Cache ``A_e^{-1}`` and ``beta_e``.
 
         PILCO optimises the policy with the dynamics hyper-parameters held fixed,
-        so this cache is hit for the whole inner BFGS loop; it is invalidated
+        so this cache is hit for the whole inner L-BFGS loop; it is invalidated
         whenever the buffers or the log-hyper-parameters change.
+
+        When the hyper-parameters *do* require gradients the cache is bypassed:
+        caching graph-attached tensors would make the next ``backward()`` fail
+        with "trying to backward through the graph a second time", because the
+        cached sub-graph would be traversed twice.
         """
+        needs_graph = (self.log_lengthscales.requires_grad
+                       or self.log_signal.requires_grad
+                       or self.log_noise.requires_grad)
+        if needs_graph:
+            iK, beta = [], []
+            for e in range(self.n_out):
+                A = self.gram(e)
+                iK.append(torch.linalg.inv(A))
+                beta.append(torch.linalg.solve(A, self.targets[:, e]))
+            return torch.stack(iK), torch.stack(beta, dim=1)
+
         key = (self.inputs.data_ptr(), self.targets.data_ptr(),
                self.inputs.shape,
                float(self.log_signal.sum()) + float(self.log_noise.sum())
@@ -191,10 +207,11 @@ class GpDynamicsOp(MomentOp):
         if cached == key and "iK" in self._cache:
             return self._cache["iK"], self._cache["beta"]
         iK, beta = [], []
-        for e in range(self.n_out):
-            A = self.gram(e)
-            iK.append(torch.linalg.inv(A))
-            beta.append(torch.linalg.solve(A, self.targets[:, e]))
+        with torch.no_grad():
+            for e in range(self.n_out):
+                A = self.gram(e)
+                iK.append(torch.linalg.inv(A))
+                beta.append(torch.linalg.solve(A, self.targets[:, e]))
         iK = torch.stack(iK)
         beta = torch.stack(beta, dim=1)
         self._cache = {"key": key, "iK": iK, "beta": beta}
