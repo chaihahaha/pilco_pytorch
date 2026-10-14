@@ -116,9 +116,12 @@ pilco/
   reference (table above).  On *identical* data and an identical starting policy
   the policy optimiser is comparable too: NumPy `minimize` reaches `J = 32.37`
   in 151 line searches, torch L-BFGS reaches `J = 33.34` in 187 evaluations.
-* The closed loop nevertheless does **not** reproducibly reproduce the reference's
-  cart-pole performance (reference: ≈ 9 per `H = 40` episode after one learning
-  episode; here: 19–38 depending on settings, with high seed variance).
+* The closed loop **does learn** — running eight episodes with
+  `gp_iterations=30, policy_iterations=60` reaches **11.7 and 12.2** per
+  `H = 40` episode at episodes 3–4, against the NumPy reference's floor of
+  8.3–12.8 (see `results/cartpole_learning_gp30.json`).  It then **collapses back
+  to the cost ceiling** (40.0) and stays there.  So the open problem is long-run
+  *stability* of the model/policy co-adaptation, not the ability to learn.
 
 Diagnosis so far (`scripts/diagnostics/optimiser_parity.py` and the experiments
 in `docs/ARCHITECTURE.md` §8): the divergence is in **GP hyper-parameter

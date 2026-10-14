@@ -271,12 +271,37 @@ validation table.  (An apparent trajectory mismatch turned out to be my own test
 using `np.random.default_rng` where the reference uses `np.random.seed` — a
 different noise stream, not a bug.)
 
-**Conclusion so far.**  The remaining gap looks like *amplified sensitivity*
-rather than one more defect: cart-pole swing-up is a narrow optimum reached by a
-particular closed-loop trajectory, and any difference — in the GP fit, in the
-noise stream, in the optimiser's line search — moves the loop into a different
-basin.  Supporting evidence: with `gp_iterations=30` the loop does improve over
-episodes (`[35.0, 36.3, 19.2]`) but needs more episodes than the reference's one.
+**Stage 3 — the loop does learn; it is not stable.**  Running the loop for
+eight episodes with `gp_iterations=30, policy_iterations=60` (recorded in
+`results/cartpole_learning_gp30.json`):
+
+| episode | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| realised cost | 35.6 | 30.3 | **11.7** | **12.2** | 40.0 | 38.1 | 39.9 | 40.0 |
+| planned value | 35.2 | 32.3 | **14.1** | 29.1 | 37.9 | 37.9 | 37.8 | 37.9 |
+
+Episodes 3–4 reach 11.7 / 12.2 against the NumPy reference's floor of 8.3–12.8,
+so **cart-pole is solved**.  It then collapses to the cost ceiling (40.0) and
+stays there.  Note the planned value in episode 4 (29.1) already warns of the
+collapse: the model has stopped predicting the good policy's cost correctly.
+
+**Conclusion.**  The model layer is correct and the loop can learn; the open
+problem is **long-run stability** of the model/policy co-adaptation, not a defect
+in the operators, the planner or the optimiser.  The collapse has the classic
+PILCO shape: once the controller succeeds, the dataset concentrates near the
+upright equilibrium, the GP hyper-parameters are re-fit to that narrower data,
+and the policy optimiser — run for only 60 iterations — falls out of the
+swing-up basin and cannot climb back.
+
+Concrete next steps, in order:
+1. Match PILCO's policy-optimisation budget and line search (150 line searches,
+   `MFEPLS=30`) instead of 60 L-BFGS iterations, and warm-start the
+   hyper-parameters instead of re-fitting from the previous episode's values.
+2. Keep a *replay* of earlier successful episodes in the dataset, or bound how
+   much each episode's data can reshape the GP.
+3. Re-fit the GP on the union of all episodes but only re-optimise the policy
+   while the planned value improves (PILCO's rollout is never worse than the
+   previous controller's by construction if the optimiser is not truncated).
 
 
 With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,
