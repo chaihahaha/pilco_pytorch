@@ -130,12 +130,21 @@ def main() -> int:
         val, n, dt, _ = evaluate(model, H)
         rows.append((label, float(model.dynamics.nlml()), val, n, dt))
 
-    # F/G: noise floor at the plant's process noise (cart-pole uses std 0.01)
-    for label, floor, iters in (("F noise floor 0.01", 0.01, 150),
-                                ("G noise floor 0.005", 0.005, 150),
-                                ("H noise floor 0.02", 0.02, 150)):
+    # F/G/H: noise floor at the plant's process noise (cart-pole uses std 0.01)
+    for label, floor in (("F noise floor 0.01", 0.01),
+                         ("G noise floor 0.005", 0.005),
+                         ("H noise floor 0.02", 0.02)):
         _, model = make_model(dm)
-        fit_hyperparameters(model.dynamics, iterations=iters, noise_floor=floor)
+        fit_hyperparameters(model.dynamics, iterations=150, noise_floor=floor)
+        val, n, dt, _ = evaluate(model, H)
+        rows.append((label, float(model.dynamics.nlml()), val, n, dt))
+
+    # I/J: tighten the lengthscale curb so the GP cannot become arbitrarily
+    # smooth (measured: the reference's fit is far smoother than ours)
+    for label, rng_ in (("I ls_range 2.0", 2.0), ("J ls_range 3.0", 3.0),
+                        ("K ls_range 1.0", 1.0)):
+        _, model = make_model(dm)
+        fit_hyperparameters(model.dynamics, iterations=150, ls_range=rng_)
         val, n, dt, _ = evaluate(model, H)
         rows.append((label, float(model.dynamics.nlml()), val, n, dt))
 

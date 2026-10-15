@@ -302,9 +302,48 @@ so **cart-pole is solved**.  It then collapses to the cost ceiling (40.0) and
 stays there.  Note the planned value in episode 4 (29.1) already warns of the
 collapse: the model has stopped predicting the good policy's cost correctly.
 
-**Conclusion.**  The model layer is correct and the loop can learn; the open
-problem is **long-run stability** of the model/policy co-adaptation, not a defect
-in the operators, the planner or the optimiser.  The collapse has the classic
+**Stage 4 — episode-by-episode reproduction.**
+``scripts/diagnostics/reproduction_check.py`` diffs the two implementations at
+each level of the loop, with the RNG routed through the same stream::
+
+    1) initial dataset / value
+       datasets identical        : True
+       J numpy=39.3781746773  torch=39.3781753472  diff=6.70e-07
+    2) GP fit on that dataset      <-- the divergence
+       numpy  log ell[out0] = [5.1506 2.0613 5.9450 2.9242 3.6780]
+       torch  log ell[out0] = [2.7337 1.1466 2.5401 0.0022 2.7201]
+       hyper-parameter max abs diff = 3.4049
+       -NLML  numpy -51.2716   torch -17.6107
+    3) policy value after the same optimiser
+       reference fit 33.8543   torch fit 35.8010
+
+So the *only* level at which the two implementations disagree is the point the
+GP fit stops at.  The reference's fit is much **smoother** (log-lengthscales up
+to 5.95 against the input spread's 1.73) than a converged fit (2.73 against the
+same 1.73), and at 40 data points the smoother model yields the better policy.
+
+**Closing the gap (measured).**  `scripts/diagnostics/followup_experiments.py
+--part A` sweeps the lengthscale curb (``ls_range``, in log units from
+``log std(inputs)``):
+
+| fit | policy value |
+| --- | --- |
+| reference hyper-parameters (no fitting) | **33.85** |
+| `ls_range=None` (PILCO's own curb) | 35.80 |
+| `ls_range=3.0` | **34.91** |
+| `ls_range=2.0` | 35.71 |
+| `ls_range=1.5` | 36.01 |
+
+`ls_range=3.0` recovers about half of the gap; the response is not monotonic, so
+it is exposed as an option (`PilcoConfig.ls_range`) rather than a default.
+
+**Conclusion.**  The model layer is correct, the loop can learn, and the
+remaining divergence is *a stopping rule*: PILCO's weak MATLAB-style `minimize`
+halts at a smooth, slightly under-fitted GP, and at this data size that happens
+to control better than a converged fit.  Reproducing it exactly would mean
+imitating the stopping rule.  The open problem is therefore two-fold:
+**long-run stability** of the model/policy co-adaptation, and **choosing the GP
+fit by control quality rather than marginal likelihood**.  The collapse has the classic
 PILCO shape: once the controller succeeds, the dataset concentrates near the
 upright equilibrium, the GP hyper-parameters are re-fit to that narrower data,
 and the policy optimiser — run for only 60 iterations — falls out of the

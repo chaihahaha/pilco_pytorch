@@ -122,6 +122,15 @@ pilco/
   8.3–12.8 (see `results/cartpole_learning_gp30.json`).  It then **collapses back
   to the cost ceiling** (40.0) and stays there.  So the open problem is long-run
   *stability* of the model/policy co-adaptation, not the ability to learn.
+* **Where the two implementations actually diverge** is now pinned down.  They
+  agree on the initial dataset, on the value (7e-7), on the gradient at *every*
+  one of PILCO's 57 optimiser iterates (max 1.5e-4 relative) and on the GP
+  training objective (1e-9 per output).  The divergence is the *point the GP fit
+  stops at*: NumPy's `minimize` halts at a much smoother model
+  (log-lengthscales up to 5.95) than a converged fit (2.73), and on 40 data
+  points the smoother model controls better (policy value 33.85 vs 35.80).
+  Autograd drift is ruled out.  Tightening the lengthscale curb
+  (`PilcoConfig.ls_range=3.0`) recovers about half the gap (34.91).
 
 Diagnosis so far (`scripts/diagnostics/optimiser_parity.py` and the experiments
 in `docs/ARCHITECTURE.md` §8): the divergence is in **GP hyper-parameter

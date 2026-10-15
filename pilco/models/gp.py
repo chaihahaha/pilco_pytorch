@@ -64,7 +64,8 @@ def build_dynamics_op(inputs: torch.Tensor, targets: torch.Tensor,
 
 def curbed_nlml(op: GpDynamicsOp, input_std: torch.Tensor,
                 ls_max: float = 100.0, snr_max: float = SNR_MAX,
-                power: float = 30.0) -> torch.Tensor:
+                power: float = 30.0,
+                ls_range: Optional[float] = None) -> torch.Tensor:
     """PILCO's curbed negative log marginal likelihood (``gp/hypCurb.py``).
 
     The original does not *clamp* the hyper-parameters, it adds a sharp
@@ -89,8 +90,16 @@ def curbed_nlml(op: GpDynamicsOp, input_std: torch.Tensor,
     if std.numel() == 1:
         std = std.expand(op.log_lengthscales.shape[0])
     ll = op.log_lengthscales
-    f = f + (((ll - torch.log(std.clamp(min=1e-6))[:, None])
-              / math.log(ls_max)) ** power).sum()
+    # ``ls_max`` reproduces PILCO's own curb; ``ls_range`` (in log units) is a
+    # tighter alternative that keeps the lengthscale within ``exp(ls_range)`` of
+    # the input spread.  It matters because the *smoothness* of the GP, not just
+    # its marginal likelihood, decides whether the planner can trust it: on the
+    # 40-point cart-pole dataset the reference's fit sits at log-lengthscales
+    # [5.15, 2.06, 5.95, 2.92, 3.68] (a very smooth model) while an unconstrained
+    # fit goes to [2.73, 1.15, 2.54, 0.002, 2.72], and the smooth model yields a
+    # 6% better policy value.
+    scale = (math.log(ls_max) if ls_range is None else float(ls_range))
+    f = f + (((ll - torch.log(std.clamp(min=1e-6))[:, None]) / scale) ** power).sum()
     f = f + (((op.log_signal - op.log_noise) / math.log(snr_max)) ** power).sum()
     return f
 
@@ -99,7 +108,8 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
                         tolerance: float = 1e-8,
                         verbose: bool = False,
                         use_curb: bool = True,
-                        noise_floor: float = 0.0) -> GpDynamicsOp:
+                        noise_floor: float = 0.0,
+                        ls_range: Optional[float] = None) -> GpDynamicsOp:
     """Maximise the curbed marginal likelihood with L-BFGS (in place).
 
     Parameters
@@ -154,7 +164,8 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
         # set and an unbounded lengthscale can make the Gram matrix numerically
         # singular.
         project()
-        loss = (curbed_nlml(op, input_std) if use_curb else op.nlml())
+        loss = (curbed_nlml(op, input_std, ls_range=ls_range)
+                if use_curb else op.nlml())
         loss.backward()
         for p in params:
             if p.grad is not None and not p.grad.is_contiguous():

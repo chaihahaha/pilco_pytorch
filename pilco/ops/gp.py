@@ -160,12 +160,13 @@ class GpDynamicsOp(MomentOp):
         """
         value = torch.as_tensor(value)
         d = self.n_in
-        if self.share_lengthscales:
-            self.log_lengthscales.copy_(value[:d, :1])
-        else:
-            self.log_lengthscales.copy_(value[:d])
-        self.log_signal.copy_(value[d])
-        self.log_noise.copy_(value[d + 1])
+        with torch.no_grad():
+            if self.share_lengthscales:
+                self.log_lengthscales.copy_(value[:d, :1])
+            else:
+                self.log_lengthscales.copy_(value[:d])
+            self.log_signal.copy_(value[d])
+            self.log_noise.copy_(value[d + 1])
         self.invalidate_cache()
 
     def log_hyp(self) -> torch.Tensor:

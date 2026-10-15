@@ -81,6 +81,20 @@ class PilcoConfig:
     #: model-predicted cost under the current model (otherwise keep the previous
     #: one).  This is the "never roll out a worse controller" guard.
     accept_if_improved: bool = True
+    #: draw process noise from NumPy's legacy global stream
+    #: (``np.random.seed`` / ``np.random.randn``) exactly like
+    #: ``pilco_python`` does.  Only useful for an apples-to-apples
+    #: reproduction comparison.
+    legacy_rng: bool = False
+    #: Step 1c -- lengthscale-curb half-width, in log units, relative to
+    #: ``log std(inputs)``.  ``None`` means PILCO's own curb (``log 100``,
+    #: which is loose enough to be inactive in practice).  Measured effect
+    #: on the 40-point cart-pole dataset, policy value after the same
+    #: optimiser: reference fit 33.85, no curb 35.80, 3.0 -> 34.91,
+    #: 2.0 -> 35.71, 1.5 -> 36.01.  ``3.0`` therefore recovers about half
+    #: of the gap, but the response is not monotonic, so it is an option
+    #: rather than a default (see docs/ARCHITECTURE.md section 8).
+    ls_range: Optional[float] = None
 
 
 @dataclass
@@ -200,6 +214,10 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
     config = config or PilcoConfig()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
+    # route the scenario's process noise through NumPy's legacy stream so that a
+    # reproduction comparison against pilco_python sees the SAME noise
+    if hasattr(scenario, "use_legacy_rng"):
+        scenario.use_legacy_rng = bool(config.legacy_rng)
     generator = torch.Generator().manual_seed(config.seed)
     rng = np.random.default_rng(config.seed + 1000)
 
@@ -231,7 +249,8 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
         model = make_model(scenario, inputs, targets, policy, log_hyp)
         previous_hyp = log_hyp.clone()
         fit_hyperparameters(model.dynamics, iterations=config.gp_iterations,
-                            noise_floor=config.noise_floor)
+                            noise_floor=config.noise_floor,
+                            ls_range=config.ls_range)
         # --- Step 2: bound how far one episode may reshape the model --------
         if config.hyperparameter_trust_region > 0.0:
             with torch.no_grad():

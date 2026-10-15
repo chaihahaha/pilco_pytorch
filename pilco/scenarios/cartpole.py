@@ -133,8 +133,16 @@ class CartPole:
         return control
 
     # ------------------------------------------------------------------
+    #: When set, ``rollout_true`` draws its noise from NumPy's *global* legacy
+    #: stream (``np.random.seed`` / ``np.random.randn``) instead of a
+    #: ``Generator``.  ``pilco_python`` uses the legacy stream, so this flag is
+    #: what makes an episode-by-episode reproduction comparison possible at all:
+    #: otherwise the two loops see different process noise and their trajectories
+    #: diverge for reasons that have nothing to do with the maths.
+    use_legacy_rng: bool = False
+
     def rollout_true(self, model: PilcoModel, x0: np.ndarray, steps: int,
-                     rng: np.random.Generator, with_noise: bool = True):
+                     rng=None, with_noise: bool = True):
         """Roll out the *true* environment, returning states/controls/costs.
 
         Matches ``base/rollout.py``: process noise is added to every component
@@ -142,14 +150,16 @@ class CartPole:
         """
         control = self.policy_numpy(model)
         x0 = np.asarray(x0, dtype=np.float64).ravel()
-        state = x0 + rng.standard_normal(4) * self.process_noise if with_noise else x0.copy()
+        randn = (np.random.randn if self.use_legacy_rng
+                 else lambda *shape: rng.standard_normal(shape))
+        state = (x0 + randn(4) * self.process_noise) if with_noise else x0.copy()
         states = [state.copy()]
         controls, costs = [], []
         for _ in range(steps):
             u = control(state)
             nxt = self.step_true(state, u)
             if with_noise:
-                nxt = nxt + rng.standard_normal(4) * self.process_noise
+                nxt = nxt + randn(4) * self.process_noise
             c = self.cost.expected(
                 torch.as_tensor(state, dtype=DTYPE),
                 torch.zeros(4, 4, dtype=DTYPE))
