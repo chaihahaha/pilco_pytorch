@@ -130,6 +130,15 @@ def main() -> int:
         val, n, dt, _ = evaluate(model, H)
         rows.append((label, float(model.dynamics.nlml()), val, n, dt))
 
+    # F/G: noise floor at the plant's process noise (cart-pole uses std 0.01)
+    for label, floor, iters in (("F noise floor 0.01", 0.01, 150),
+                                ("G noise floor 0.005", 0.005, 150),
+                                ("H noise floor 0.02", 0.02, 150)):
+        _, model = make_model(dm)
+        fit_hyperparameters(model.dynamics, iterations=iters, noise_floor=floor)
+        val, n, dt, _ = evaluate(model, H)
+        rows.append((label, float(model.dynamics.nlml()), val, n, dt))
+
     print(f"\n{'variant':26s} {'-NLML':>10s} {'policy J':>10s} {'evals':>6s} {'sec':>6s}")
     print("-" * 64)
     for label, nlml, val, n, dt in rows:

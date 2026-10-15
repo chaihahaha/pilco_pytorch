@@ -153,6 +153,21 @@ class GpDynamicsOp(MomentOp):
                    individual_noise=individual_noise,
                    share_lengthscales=share_lengthscales)
 
+    def set_log_hyp(self, value: torch.Tensor) -> None:
+        """Overwrite the hyper-parameters from a ``(d + 2, E)`` tensor.
+
+        Used by the learning loop's trust region and best-so-far bookkeeping.
+        """
+        value = torch.as_tensor(value)
+        d = self.n_in
+        if self.share_lengthscales:
+            self.log_lengthscales.copy_(value[:d, :1])
+        else:
+            self.log_lengthscales.copy_(value[:d])
+        self.log_signal.copy_(value[d])
+        self.log_noise.copy_(value[d + 1])
+        self.invalidate_cache()
+
     def log_hyp(self) -> torch.Tensor:
         """The hyper-parameters in PILCO's ``(d + 2, E)`` layout."""
         ell = self.log_lengthscales

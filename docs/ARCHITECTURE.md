@@ -271,6 +271,23 @@ validation table.  (An apparent trajectory mismatch turned out to be my own test
 using `np.random.default_rng` where the reference uses `np.random.seed` — a
 different noise stream, not a bug.)
 
+**Stage 2b — the operators are not at fault, and neither is autograd.**
+``scripts/diagnostics/optimizer_trace.py`` re-evaluates the PyTorch model at
+*every one* of PILCO's 57 BFGS line-search iterates on the same data::
+
+    max |J_torch - J_numpy|     = 1.299e-05
+    max rel |g_torch - g_numpy| = 1.542e-04
+
+and, started from NumPy's final parameters, torch's L-BFGS reaches a *lower*
+objective (16.98 vs 17.24).  So there is no autograd drift and the policy
+optimiser is not weaker.  ``scripts/diagnostics/gp_training_parity.py`` checks
+the GP objective the same way and finds it **identical per output** (numpy
+``gpr`` and torch ``nlml`` agree to 1e-9 at the same hyper-parameters; an earlier
+apparent 159-unit discrepancy was my own comparison of one output against the
+sum of four).  The genuine difference is that torch's L-BFGS converges further
+than PILCO's MATLAB-style ``minimize`` and lands at NLML -17.6 where the
+reference stops at +51.3.
+
 **Stage 3 — the loop does learn; it is not stable.**  Running the loop for
 eight episodes with `gp_iterations=30, policy_iterations=60` (recorded in
 `results/cartpole_learning_gp30.json`):
@@ -293,15 +310,26 @@ upright equilibrium, the GP hyper-parameters are re-fit to that narrower data,
 and the policy optimiser — run for only 60 iterations — falls out of the
 swing-up basin and cannot climb back.
 
-Concrete next steps, in order:
-1. Match PILCO's policy-optimisation budget and line search (150 line searches,
-   `MFEPLS=30`) instead of 60 L-BFGS iterations, and warm-start the
-   hyper-parameters instead of re-fitting from the previous episode's values.
-2. Keep a *replay* of earlier successful episodes in the dataset, or bound how
-   much each episode's data can reshape the GP.
-3. Re-fit the GP on the union of all episodes but only re-optimise the policy
-   while the planned value improves (PILCO's rollout is never worse than the
-   previous controller's by construction if the optimiser is not truncated).
+**The three-step fix route is implemented** as `PilcoConfig` knobs
+(`pilco/pilco.py`):
+
+| step | knob | default | status |
+| --- | --- | --- | --- |
+| 1. optimiser budget | `policy_iterations` (L-BFGS iterations; PILCO counts *line searches* with `MFEPLS=30` each) | 300 | on |
+| 1b. GP noise floor | `noise_floor` | 0.0 | **measured to hurt** — see the `fit_hyperparameters` docstring; left off |
+| 2. bound model reshaping | `hyperparameter_trust_region` (log units per episode) | 0.0 | off by default |
+| 2b. keep the best model | `keep_best_hyperparameters` | True | on |
+| 3. never roll out a worse controller | `accept_if_improved` | True | on |
+
+Step 3 works as follows: after the GP is re-fit, the *incumbent* controller's
+model-predicted cost is recorded under the new model; the optimised controller is
+kept only if it improves on that baseline, otherwise the incumbent parameters are
+restored.  Every episode logs `baseline_value` and `accepted`.
+
+Note on step 3's limits: it is a *model-based* guard, so it is only as good as
+the current model.  If an episode's GP fit is bad enough that both controllers
+look equally bad to it, the guard cannot tell them apart.  That is precisely why
+steps 1-2 (budget and bounded reshaping) are listed first.
 
 
 With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,

@@ -51,12 +51,36 @@ class PilcoConfig:
     #: cart-pole: 30 iterations -> episode costs [35.0, 36.3, 19.2] (learning),
     #: 150 iterations -> [40.0, 37.7, 29.4].  See docs/ARCHITECTURE.md section 8.
     gp_iterations: int = 50
-    policy_iterations: int = 150
+    policy_iterations: int = 300
     objective: ExplorationObjective = field(default_factory=ExplorationObjective)
     seed: int = 0
     verbose: bool = True
     #: re-fit hyper-parameters from scratch every episode (PILCO warm-starts)
     retrain_from_scratch: bool = False
+
+    # ------------------------------------------------------------------
+    # Stability guards for the model/policy co-adaptation.  These are what the
+    # experiments in docs/ARCHITECTURE.md section 8 identified as the remaining
+    # problem: the loop learns cart-pole and then loses it again.  The three
+    # knobs below correspond to the three-step fix route.
+    # ------------------------------------------------------------------
+    #: Step 1 -- lower bound on the GP observation-noise standard deviation.
+    #: The GP targets are state differences from a noisy rollout, so their noise
+    #: has a physical floor.  Without one the marginal-likelihood maximiser
+    #: drives the noise to ~1e-4, the model becomes overconfident, and the
+    #: planner stops correcting.  Set this to the plant's process-noise std.
+    noise_floor: float = 0.0
+    #: Step 2 -- trust region (in log units) on how far one episode may move the
+    #: GP hyper-parameters from the previous episode's values.  ``0`` disables
+    #: it.  This bounds how much a single episode's data can reshape the model.
+    hyperparameter_trust_region: float = 0.0
+    #: Step 2b -- keep the hyper-parameters that scored the best *model-predicted*
+    #: value so far instead of blindly accepting the newest fit.
+    keep_best_hyperparameters: bool = True
+    #: Step 3 -- accept the newly optimised controller only if it improves the
+    #: model-predicted cost under the current model (otherwise keep the previous
+    #: one).  This is the "never roll out a worse controller" guard.
+    accept_if_improved: bool = True
 
 
 @dataclass
@@ -68,6 +92,11 @@ class EpisodeLog:
     information_gain: float
     n_data: int
     policy_iterations: int
+    #: model-predicted value of the controller *before* this episode's
+    #: optimisation, under this episode's model (the acceptance baseline)
+    baseline_value: float = float("nan")
+    #: whether the optimised controller was accepted by the step-3 guard
+    accepted: bool = True
 
 
 def initial_policy(scenario, initial_state: Gaussian, n_basis: int,
@@ -197,9 +226,20 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
 
     logs: list[EpisodeLog] = []
     model = None
+    best = {"value": float("inf"), "log_hyp": None, "policy": None}
     for episode in range(config.episodes):
         model = make_model(scenario, inputs, targets, policy, log_hyp)
-        fit_hyperparameters(model.dynamics, iterations=config.gp_iterations)
+        previous_hyp = log_hyp.clone()
+        fit_hyperparameters(model.dynamics, iterations=config.gp_iterations,
+                            noise_floor=config.noise_floor)
+        # --- Step 2: bound how far one episode may reshape the model --------
+        if config.hyperparameter_trust_region > 0.0:
+            with torch.no_grad():
+                delta = (model.dynamics.log_hyp() - previous_hyp).clamp(
+                    -config.hyperparameter_trust_region,
+                    config.hyperparameter_trust_region)
+                model.dynamics.set_log_hyp(previous_hyp + delta)
+                model.dynamics.invalidate_cache()
         log_hyp = model.dynamics.log_hyp()
 
         objective = config.objective
@@ -209,19 +249,46 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
                 info_weight=objective.info_weight,
                 cross_terms=objective.cross_terms,
                 episodes_remaining=max(config.episodes - episode, 1))
+
+        # --- Step 3: baseline = the incumbent controller under the NEW model
+        baseline = float("inf")
+        if config.accept_if_improved:
+            with torch.no_grad():
+                baseline = float(plan(model, plan_state, config.horizon).value())
+            snapshot = _policy_snapshot(model)
+
         if log is not None and config.verbose:
             log(f"  episode {episode + 1}/{config.episodes}: "
-                f"data={inputs.shape[0]} GP NLML={float(model.dynamics.nlml()):.4e}")
+                f"data={inputs.shape[0]} GP NLML={float(model.dynamics.nlml()):.4e}"
+                + (f" baseline={baseline:.3f}" if config.accept_if_improved else ""))
 
-        value, n_iter = optimise_policy(model, plan_state, config, objective,
-                                        verbose=config.verbose)
-        # report the *diagnostic* quantities for the chosen controller
+        _, n_iter = optimise_policy(model, plan_state, config, objective,
+                                    verbose=config.verbose)
         with torch.no_grad():
             traj = plan(model, plan_state, config.horizon, with_jacobians=True)
             from .objectives import cumulative_cost_variance, information_gain
             pred = float(traj.value())
             var = float(cumulative_cost_variance(traj, model))
             ig = float(information_gain(traj, model))
+
+        # --- Step 3: never keep a controller the model says is worse -------
+        accepted = True
+        if config.accept_if_improved and pred > baseline:
+            accepted = False
+            _policy_restore(model, snapshot)
+            with torch.no_grad():
+                traj = plan(model, plan_state, config.horizon, with_jacobians=True)
+                pred = float(traj.value())
+                var = float(cumulative_cost_variance(traj, model))
+                ig = float(information_gain(traj, model))
+            if log is not None and config.verbose:
+                log(f"    rejected (predicted {pred:.3f} > baseline "
+                    f"{baseline:.3f}); keeping the incumbent controller")
+
+        # --- Step 2b: remember the best model-predicted controller ---------
+        if config.keep_best_hyperparameters and pred < best["value"]:
+            best = {"value": pred, "log_hyp": log_hyp.clone(),
+                    "policy": _policy_snapshot(model)}
 
         # --- roll out the true system and log the realised cost -------------
         x0 = (initial_state.mean.numpy()
@@ -234,13 +301,35 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
         targets = torch.cat([targets, torch.as_tensor(t, dtype=DTYPE)])
         logs.append(EpisodeLog(episode, np.asarray(costs), pred,
                                float(np.sqrt(max(var, 0.0))), ig,
-                               int(inputs.shape[0]), n_iter))
+                               int(inputs.shape[0]), n_iter,
+                               baseline, accepted))
         if log is not None and config.verbose:
             log(f"    realised cost {float(np.sum(costs)):7.2f}   "
                 f"predicted {pred:7.2f} +- {np.sqrt(max(var, 0.0)):6.2f}   "
-                f"IG {ig:7.2f}")
+                f"IG {ig:7.2f}" + ("" if accepted else "  [kept incumbent]"))
+
+    # --- Step 2b: hand back the best model-predicted controller ------------
+    if config.keep_best_hyperparameters and best["policy"] is not None:
+        _policy_restore(model, best["policy"])
+        with torch.no_grad():
+            model.dynamics.set_log_hyp(best["log_hyp"])
 
     return model, logs
+
+
+def _policy_params(model):
+    return [model.policy.centers, model.policy.targets,
+            model.policy.log_lengthscales]
+
+
+def _policy_snapshot(model) -> list:
+    return [p.detach().clone() for p in _policy_params(model)]
+
+
+def _policy_restore(model, snapshot) -> None:
+    with torch.no_grad():
+        for p, v in zip(_policy_params(model), snapshot):
+            p.copy_(v)
 
 
 def _random_rollout(scenario, x0: np.ndarray, steps: int,

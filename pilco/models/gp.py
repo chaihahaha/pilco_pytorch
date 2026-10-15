@@ -98,7 +98,8 @@ def curbed_nlml(op: GpDynamicsOp, input_std: torch.Tensor,
 def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
                         tolerance: float = 1e-8,
                         verbose: bool = False,
-                        use_curb: bool = True) -> GpDynamicsOp:
+                        use_curb: bool = True,
+                        noise_floor: float = 0.0) -> GpDynamicsOp:
     """Maximise the curbed marginal likelihood with L-BFGS (in place).
 
     Parameters
@@ -112,13 +113,34 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
         Apply PILCO's sharp penalty on the lengthscales and the SNR (see
         :func:`curbed_nlml`).  Disabling it is useful for experiments but lets
         the fit run away on small datasets.
+    noise_floor:
+        Lower bound on the observation-noise standard deviation.  Motivation:
+        the GP targets are *state differences* from a rollout that already
+        contains process noise, so their observation noise has a physical floor,
+        while an unconstrained marginal-likelihood maximiser drives it to ~1e-4.
+
+        **Measured on cart-pole, this does not help and is off by default.**
+        ``scripts/diagnostics/gp_fit_effect.py`` reports the policy value after
+        the same optimiser for: NumPy's fit 33.85, torch's unconstrained fit
+        35.80, floor 0.01 -> 39.14, floor 0.005 -> 39.33, floor 0.02 -> 35.25.
+        The likelihood wants the noise small (constraining it raises the NLML
+        from -17.6 to 1739 at floor 0.01), so the floor mostly distorts the
+        lengthscales.  It is kept as an option because it is the right knob for a
+        genuinely noisy plant, but it is not the fix for the closed-loop gap.
     """
     params = [op.log_lengthscales, op.log_signal, op.log_noise]
     input_std = torch.std(op.inputs, dim=0)
-    with torch.no_grad():
-        op.log_lengthscales.clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
-        op.log_noise.copy_(torch.minimum(op.log_noise,
-                                         op.log_signal - math.log(SNR_MAX)))
+
+    def project():
+        """Keep the hyper-parameters on PILCO's feasible set."""
+        with torch.no_grad():
+            op.log_lengthscales.clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
+            op.log_noise.copy_(torch.minimum(
+                op.log_noise, op.log_signal - math.log(SNR_MAX)))
+            if noise_floor > 0.0:
+                op.log_noise.clamp_(min=math.log(noise_floor))
+
+    project()
     optimiser = torch.optim.LBFGS(params, lr=1.0, max_iter=iterations,
                                   tolerance_grad=tolerance,
                                   tolerance_change=1e-12,
@@ -131,10 +153,7 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
         # Project *before* evaluating: L-BFGS probes points outside the feasible
         # set and an unbounded lengthscale can make the Gram matrix numerically
         # singular.
-        with torch.no_grad():
-            op.log_lengthscales.clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
-            op.log_noise.copy_(torch.minimum(
-                op.log_noise, op.log_signal - math.log(SNR_MAX)))
+        project()
         loss = (curbed_nlml(op, input_std) if use_curb else op.nlml())
         loss.backward()
         for p in params:
