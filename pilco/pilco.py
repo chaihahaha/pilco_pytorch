@@ -75,8 +75,20 @@ class PilcoConfig:
     #: it.  This bounds how much a single episode's data can reshape the model.
     hyperparameter_trust_region: float = 0.0
     #: Step 2b -- keep the hyper-parameters that scored the best *model-predicted*
-    #: value so far instead of blindly accepting the newest fit.
+    #: value so far instead of blindly accepting the newest fit.  Restoring
+    #: happens once, at the end of learning, so the returned model is the best
+    #: model-predicted one.
     keep_best_hyperparameters: bool = True
+    #: Step 2c -- reject a GP *refit* that makes the known-good controller look
+    #: worse.  This targets the measured failure mechanism: the episode-3/4
+    #: controller solves cart-pole, then the next refit (on data now concentrated
+    #: near the equilibrium) both loses the swing-up region and reports the
+    #: incumbent controller as bad, so the planner is talked out of it.  The
+    #: step-3 guard cannot catch that, because it compares controllers *under the
+    #: degraded model*.  Here the candidate fit and the best-so-far fit are
+    #: compared on the same controller: if the best-so-far model gives it a lower
+    #: predicted cost, the refit is discarded.
+    reject_worse_model: bool = False
     #: Step 3 -- accept the newly optimised controller only if it improves the
     #: model-predicted cost under the current model (otherwise keep the previous
     #: one).  This is the "never roll out a worse controller" guard.
@@ -260,6 +272,23 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
                 model.dynamics.set_log_hyp(previous_hyp + delta)
                 model.dynamics.invalidate_cache()
         log_hyp = model.dynamics.log_hyp()
+
+        # --- Step 2c: reject a refit that makes the known-good controller look
+        # worse (see PilcoConfig.reject_worse_model) ------------------------
+        if config.reject_worse_model and best["log_hyp"] is not None:
+            candidate = log_hyp.clone()
+            with torch.no_grad():
+                j_cand = float(plan(model, plan_state, config.horizon).value())
+                model.dynamics.set_log_hyp(best["log_hyp"])
+                j_best = float(plan(model, plan_state, config.horizon).value())
+                if j_best <= j_cand:
+                    log_hyp = best["log_hyp"].clone()
+                    if log is not None and config.verbose:
+                        log(f"    model refit rejected: {j_cand:.3f} under the new "
+                            f"fit vs {j_best:.3f} under the best-so-far fit")
+                else:
+                    model.dynamics.set_log_hyp(candidate)
+                    log_hyp = candidate
 
         objective = config.objective
         if objective.kind == "gittins":

@@ -365,10 +365,30 @@ model-predicted cost is recorded under the new model; the optimised controller i
 kept only if it improves on that baseline, otherwise the incumbent parameters are
 restored.  Every episode logs `baseline_value` and `accepted`.
 
-Note on step 3's limits: it is a *model-based* guard, so it is only as good as
-the current model.  If an episode's GP fit is bad enough that both controllers
-look equally bad to it, the guard cannot tell them apart.  That is precisely why
-steps 1-2 (budget and bounded reshaping) are listed first.
+**Measured effect of step 3** (`followup_experiments.py --part B`, 8 episodes,
+`gp_iterations=30, policy_iterations=60`):
+
+| run | realised cost per episode |
+| --- | --- |
+| gating OFF | 35.6, 30.3, 11.7, 12.2, 40.0, 38.1, 39.9, 40.0 |
+| gating ON | 35.6, 30.3, 11.7, 12.2, 40.0, 38.1, 39.9, 40.0 |
+
+Identical, and `accepted = [1]*8` — **the guard never fires**.  The gating-OFF run
+reproducing the previously recorded numbers exactly is a useful regression check
+of the refactor, but step 3 as formulated does not fix the collapse.
+
+The reason is structural: step 3 is a *model-based* guard, and it compares the two
+controllers **under the degraded model**.  Once the refit has lost the swing-up
+region, both the incumbent and the new controller look bad to it, and the
+optimiser's controller is the better of the two *in that model*.  A guard that
+cannot see the model degrade cannot protect against it.
+
+That motivates step 2c, `reject_worse_model`, which instead compares the
+**candidate fit against the best-so-far fit on the same controller**: if the
+best-so-far model gives the known-good controller a lower predicted cost, the
+refit is discarded.  This is model selection by predicted control performance
+rather than by marginal likelihood, and it targets the measured mechanism (the
+episode-3/4 policy is fine; it is the *model* that stops believing in it).
 
 
 With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,

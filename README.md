@@ -132,6 +132,13 @@ pilco/
   points the smoother model controls better (policy value 33.85 vs 35.80).
   Autograd drift is ruled out.  Tightening the lengthscale curb
   (`PilcoConfig.ls_range=3.0`) recovers about half the gap (34.91).
+* **Of the stability guards, only the model-level one can work.**  The step-3
+  acceptance guard (accept the optimised controller only if the model says it is
+  better) was measured: it never fires (`accepted = [1]*8`) and the cost sequence
+  is byte-identical to the unguarded run, because it compares controllers *under
+  the already-degraded model*.  See `PilcoConfig.reject_worse_model` for the
+  guard that instead compares the candidate GP fit against the best-so-far fit on
+  the same controller.
 
 Diagnosis so far (`scripts/diagnostics/optimiser_parity.py` and the experiments
 in `docs/ARCHITECTURE.md` §8): the divergence is in **GP hyper-parameter
