@@ -165,8 +165,9 @@ def main() -> int:
                  {"length": args.iters, "MFEPLS": 30, "verbosity": 0},
                  mu0Sim, S0Sim, dm, pol, plant, cost, H)
 
-    print(f"numpy BFGS: {len(records)} line searches, "
-          f"J {records[0]['J']:.6f} -> {records[-1]['J']:.6f}")
+    print(f"numpy BFGS (length={args.iters} line searches): {len(records)} "
+          f"objective evaluations, J {records[0]['J']:.6f} -> "
+          f"{records[-1]['J']:.6f}")
     checked = [r for r in records if "dJ" in r]
     if checked:
         print(f"torch re-evaluation at the SAME {len(checked)} iterates:")
@@ -219,7 +220,7 @@ def main() -> int:
         print(f"  {k:>4} {records[k]['J']:>14.6f} {trec[k]['J']:>14.6f} "
               f"{records[k]['J'] - trec[k]['J']:>12.2e}")
     print(f"\n numpy final J = {records[-1]['J']:.6f}  "
-          f"({len(records)} line searches)")
+          f"({len(records)} objective evaluations)")
     print(f" torch final J = {trec[-1]['J']:.6f}  ({len(trec)} evaluations)")
     return 0
 

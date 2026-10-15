@@ -273,7 +273,7 @@ different noise stream, not a bug.)
 
 **Stage 2b — the operators are not at fault, and neither is autograd.**
 ``scripts/diagnostics/optimizer_trace.py`` re-evaluates the PyTorch model at
-*every one* of PILCO's 57 BFGS line-search iterates on the same data::
+*every one* of the 57 objective evaluations PILCO's BFGS made on the same data::
 
     max |J_torch - J_numpy|     = 1.299e-05
     max rel |g_torch - g_numpy| = 1.542e-04

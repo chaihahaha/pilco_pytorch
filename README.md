@@ -124,7 +124,8 @@ pilco/
   *stability* of the model/policy co-adaptation, not the ability to learn.
 * **Where the two implementations actually diverge** is now pinned down.  They
   agree on the initial dataset, on the value (7e-7), on the gradient at *every*
-  one of PILCO's 57 optimiser iterates (max 1.5e-4 relative) and on the GP
+  one of the 57 objective evaluations PILCO's optimiser makes (max 1.5e-4 relative),
+  and on the GP
   training objective (1e-9 per output).  The divergence is the *point the GP fit
   stops at*: NumPy's `minimize` halts at a much smoother model
   (log-lengthscales up to 5.95) than a converged fit (2.73), and on 40 data
