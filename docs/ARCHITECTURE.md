@@ -383,12 +383,42 @@ region, both the incumbent and the new controller look bad to it, and the
 optimiser's controller is the better of the two *in that model*.  A guard that
 cannot see the model degrade cannot protect against it.
 
-That motivates step 2c, `reject_worse_model`, which instead compares the
-**candidate fit against the best-so-far fit on the same controller**: if the
-best-so-far model gives the known-good controller a lower predicted cost, the
-refit is discarded.  This is model selection by predicted control performance
-rather than by marginal likelihood, and it targets the measured mechanism (the
-episode-3/4 policy is fine; it is the *model* that stops believing in it).
+That motivated step 2c, `reject_worse_model`, which compares the **candidate fit
+against the best-so-far fit on the same controller** and snaps back (with a short
+re-fit, since a hard restore pairs old hyper-parameters with new data and was
+observed to make the Gram matrix singular).  Measured:
+
+| run | realised cost per episode (6 episodes) |
+| --- | --- |
+| unguarded | 35.6, 30.3, 11.7, 12.2, 40.0, 38.1 |
+| `reject_worse_model` | 35.6, 26.4, 33.1, **9.7**, 39.9, 40.0 |
+
+It changes the trajectory and reaches **9.7**, below the reference's own floor —
+so the loop can find a better controller than PILCO's — but it **still collapses**,
+and on this seed the 6-episode total is worse (184.7 vs 167.9).
+
+**Verdict on the three-step route: implemented, measured, and not sufficient.**
+`results/followup_guards_summary.json` collects the numbers:
+
+| guard | measured verdict |
+| --- | --- |
+| acceptance (step 3) | inert — never fires |
+| noise floor | hurts (39.1 / 39.3 / 35.3 vs 33.85) |
+| shared lengthscales | hurts (38.3) |
+| lengthscale curb `ls_range=3.0` | recovers about half the *reproduction* gap (34.91) |
+| model rejection (step 2c) | changes the trajectory, reaches 9.7, still collapses |
+
+The structural reason all model-based guards fail is the same in each case: **the
+model is the oracle the guard consults.** Once the refit has lost the swing-up
+region, every controller — including the good one — looks bad to it, so no
+comparison *within that model* can recover the right answer.
+
+The remaining lever is therefore at the data/model level, not the guard level:
+the loop already observes the realised cost of every episode it executes, so it
+can validate the model on data it actually collected (compare the predicted cost
+of the executed controller against the realised one and reject a refit whose
+prediction error jumps), or detect covariate shift in the GP inputs when the
+dataset concentrates near the equilibrium.  Neither is implemented here.
 
 
 With ≤ 80 data points and 32 GP hyper-parameters (6 ARD lengthscales × 4 outputs,

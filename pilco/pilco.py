@@ -34,6 +34,9 @@ __all__ = ["PilcoConfig", "initial_policy", "optimise_policy", "learn",
 
 DTYPE = torch.float64
 
+#: L-BFGS iterations used when snapping the GP back towards the best-so-far fit.
+SNAP_BACK_ITERS = 15
+
 
 @dataclass
 class PilcoConfig:
@@ -257,6 +260,7 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
     logs: list[EpisodeLog] = []
     model = None
     best = {"value": float("inf"), "log_hyp": None, "policy": None}
+    model_rejections: list[int] = []
     for episode in range(config.episodes):
         model = make_model(scenario, inputs, targets, policy, log_hyp)
         previous_hyp = log_hyp.clone()
@@ -277,18 +281,34 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
         # worse (see PilcoConfig.reject_worse_model) ------------------------
         if config.reject_worse_model and best["log_hyp"] is not None:
             candidate = log_hyp.clone()
-            with torch.no_grad():
-                j_cand = float(plan(model, plan_state, config.horizon).value())
+            decision = _compare_models(model, plan_state, config, best["log_hyp"])
+            if decision is None:
+                # a numerical failure while evaluating one of the two models:
+                # keep the freshly fitted one and carry on rather than aborting
+                model.dynamics.set_log_hyp(candidate)
+                log_hyp = candidate
+                if log is not None and config.verbose:
+                    log("    model comparison failed numerically; keeping the new fit")
+            elif decision:
+                # Snap back towards the best-so-far fit, then re-fit *briefly* on
+                # the current data.  A hard restore would pair hyper-parameters
+                # fitted to an earlier, smaller dataset with the current one,
+                # which can leave the Gram matrix numerically singular (observed).
                 model.dynamics.set_log_hyp(best["log_hyp"])
-                j_best = float(plan(model, plan_state, config.horizon).value())
-                if j_best <= j_cand:
-                    log_hyp = best["log_hyp"].clone()
-                    if log is not None and config.verbose:
-                        log(f"    model refit rejected: {j_cand:.3f} under the new "
-                            f"fit vs {j_best:.3f} under the best-so-far fit")
-                else:
-                    model.dynamics.set_log_hyp(candidate)
-                    log_hyp = candidate
+                try:
+                    fit_hyperparameters(model.dynamics, iterations=SNAP_BACK_ITERS,
+                                        noise_floor=config.noise_floor,
+                                        ls_range=config.ls_range)
+                except RuntimeError:
+                    model.dynamics.set_log_hyp(best["log_hyp"])
+                log_hyp = model.dynamics.log_hyp().clone()
+                model_rejections.append(episode)
+                if log is not None and config.verbose:
+                    log("    model refit rejected: the best-so-far fit gives the "
+                        "incumbent controller the lower predicted cost")
+            else:
+                model.dynamics.set_log_hyp(candidate)
+                log_hyp = candidate
 
         objective = config.objective
         if objective.kind == "gittins":
@@ -334,7 +354,9 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
                     f"{baseline:.3f}); keeping the incumbent controller")
 
         # --- Step 2b: remember the best model-predicted controller ---------
-        if config.keep_best_hyperparameters and pred < best["value"]:
+        # ``best`` is maintained unconditionally: step 2c needs the best-so-far
+        # *model* whether or not the caller wants the final rollback.
+        if pred < best["value"]:
             best = {"value": pred, "log_hyp": log_hyp.clone(),
                     "policy": _policy_snapshot(model)}
 
@@ -356,6 +378,9 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
                 f"predicted {pred:7.2f} +- {np.sqrt(max(var, 0.0)):6.2f}   "
                 f"IG {ig:7.2f}" + ("" if accepted else "  [kept incumbent]"))
 
+    if log is not None and config.verbose and model_rejections:
+        log(f"  model refits rejected in episodes {model_rejections}")
+
     # --- Step 2b: hand back the best model-predicted controller ------------
     if config.keep_best_hyperparameters and best["policy"] is not None:
         _policy_restore(model, best["policy"])
@@ -363,6 +388,32 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
             model.dynamics.set_log_hyp(best["log_hyp"])
 
     return model, logs
+
+
+def _compare_models(model, plan_state, config, other_hyp):
+    """Return ``True`` if ``other_hyp`` should replace the current GP fit.
+
+    Compares the two candidate models on the *same* (incumbent) controller.
+    Returns ``None`` if either evaluation fails numerically, so that a fragile
+    comparison can never abort learning.
+    """
+    import math
+
+    candidate = model.dynamics.log_hyp().clone()
+    try:
+        with torch.no_grad():
+            j_cand = float(plan(model, plan_state, config.horizon,
+                                with_jacobians=False).value())
+            model.dynamics.set_log_hyp(other_hyp)
+            j_best = float(plan(model, plan_state, config.horizon,
+                                with_jacobians=False).value())
+    except RuntimeError:
+        model.dynamics.set_log_hyp(candidate)
+        return None
+    model.dynamics.set_log_hyp(candidate)
+    if not (math.isfinite(j_cand) and math.isfinite(j_best)):
+        return None
+    return j_best <= j_cand
 
 
 def _policy_params(model):
