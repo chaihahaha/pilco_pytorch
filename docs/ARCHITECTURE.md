@@ -445,10 +445,21 @@ and then collapsed to 40.0.  The collapse was **entirely** an artefact of the GP
 refit landing in a different basin under a different optimiser; with the
 reference's own ``minimize`` the loop is stable and monotone.
 
-Remaining, smaller gaps on this protocol: it settles at ≈ 12.9 where the NumPy
-reference settles at ≈ 8.5, and episode 0 differs (37.9 vs 76.2) because the
+Across seeds (`results/cartpole_faithful_seeds.json`):
+
+| seed | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 37.9 | 28.0 | 14.5 | 14.0 | 13.8 | 12.9 |
+| 1 | 38.3 | 35.1 | 33.3 | 30.2 | 26.9 | 19.5 |
+| 2 | 34.8 | 29.3 | 14.4 | 12.7 | 12.0 | **11.6** |
+| NumPy reference (faithful protocol) | 76.2 | 12.6 | 8.6 | 8.4 | 12.8 | — |
+
+So: every seed learns monotonically and **none collapses**; seed 2 lands inside
+the reference's own 8.3-12.8 band; seed 1 is slower and still descending at
+episode 6.  Episode 0 differs from the reference (34.8-38.3 vs 76.2) because the
 initial random rollout and controller draw do not match the reference's seeding
-exactly.  Neither is a stability problem.
+exactly, and that difference cascades through the closed loop.  The remaining
+work is therefore *initialisation parity*, not stability or correctness.
 
 **Verdict on the three-step route: implemented, measured, and superseded.**
 `results/followup_guards_summary.json` collects the numbers:

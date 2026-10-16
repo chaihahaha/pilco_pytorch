@@ -139,11 +139,13 @@ pilco/
   all: with `torch.optim.LBFGS` the GP refit lands in a different basin and the
   loop loses the policy.  Using the ported `minimize`
   (`gp_optimizer="pilco", policy_optimizer="pilco", legacy_rng=True`) the loop is
-  stable and monotone: **37.9, 28.0, 14.5, 14.0, 13.8, 12.9** over six episodes
-  (against 11.7 then 40.0 for the L-BFGS run).  It settles at ≈12.9 where the
-  NumPy reference settles at ≈8.5, and episode 0 differs because the initial
-  random rollout does not match the reference's seeding exactly — neither is a
-  stability issue.
+  stable and monotone across seeds: `37.9 28.0 14.5 14.0 13.8 12.9` (seed 0),
+  `34.8 29.3 14.4 12.7 12.0 **11.6**` (seed 2, inside the NumPy reference's own
+  8.3-12.8 band) and `38.3 35.1 33.3 30.2 26.9 19.5` (seed 1, slower) — against
+  11.7 then 40.0 for the L-BFGS run.  No seed collapses.  Episode 0 differs from
+  the reference because the initial random rollout does not match the reference's
+  seeding exactly, and that cascades; the remaining work is initialisation
+  parity, not stability.
 * The four stability guards I added are therefore **superseded**: the acceptance
   guard never fires, the noise floor and shared lengthscales hurt, the
   lengthscale curb recovers about half the *reproduction* gap, and the
