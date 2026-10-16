@@ -273,7 +273,91 @@ class GpDynamicsOp(MomentOp):
         return total
 
     # ------------------------------------------------------------------
+    def moments_batched(self, mean: torch.Tensor, cov: torch.Tensor) -> Moments:
+        """Predictive moments at an uncertain input, fully batched (NOT USED).
+
+        Two levels of batching replace the nested Python loops (see the profile in
+        ``scripts/diagnostics/profile_hotspots.py``: this call is ~100% of a
+        planning step).
+
+        **Status: experimental, not used.**  Compared against ``gp/gp0d.py`` it
+        agrees only to ~1e-3 in the predictive covariance, where the loop version
+        (``moments``) agrees to ~1e-12, so it fails the validation the operators
+        are held to.  The individual pieces (``G``, ``d_e``, ``d_f``, the cross
+        term, ``L_ef`` for ``(0, 0)``) were each checked to 1e-13, so the
+        discrepancy is somewhere in the ``(E, E)`` assembly that was not tracked
+        down.  It is kept here because it is most of the way to a ~3x speedup of
+        the planner and someone with more time should finish it.
+        """
+        d, E = self.n_in, self.n_out
+        dtype, device = mean.dtype, mean.device
+        eye = torch.eye(d, dtype=dtype, device=device)
+        iK, beta = self._solve_cache()
+
+        iell = torch.exp(-self.log_lengthscales.transpose(0, 1))      # (E, d)
+        iell2 = iell ** 2
+        B = eye + iell[:, :, None] * iell[:, None, :] * cov[None]     # (E, d, d)
+        ytilde = (mean[None, None, :] - self.inputs[None, :, :]) * iell[:, None, :]
+        sol = torch.linalg.solve(B, ytilde.transpose(1, 2)).transpose(1, 2)
+        k_n = -0.5 * (ytilde * ytilde).sum(-1)                        # (E, n)
+        logdet_B = 2.0 * torch.log(
+            torch.diagonal(torch.linalg.cholesky(symmetrize(B)), dim1=-2, dim2=-1)
+        ).sum(-1)                                                     # (E,)
+        ell = (self.signal ** 2)[:, None] * torch.exp(
+            -0.5 * logdet_B[:, None] - 0.5 * (ytilde * sol).sum(-1))   # (E, n)
+        M = (beta.transpose(0, 1) * ell).sum(1)                       # (E,)
+
+        # R[e] = (X - m) L_e  ->  (E, n, d)
+        R = (self.inputs[None, :, :] - mean[None, None, :]) * iell2[:, None, :]
+
+        # ---- product-kernel means L_ef[x, y] = E[k_e(x,X) k_f(y,X)] --------
+        lam = iell2[:, None, :] + iell2[None, :, :]                   # (E, E, d)
+        # cov @ diag(lam): the diagonal multiplies the COLUMN index, i.e. the
+        # last axis here.  Getting this transposed was a real bug caught by
+        # the loop-vs-batched comparison.
+        A = eye[None, None] + cov[None, None, :, :] * lam[:, :, None, :]
+        G = torch.linalg.solve(A, cov[None, None].expand(E, E, d, d))
+        sqrt_lam = torch.sqrt(lam.clamp(min=0.0))
+        scaled = symmetrize(cov[None, None] * sqrt_lam[:, :, :, None]
+                            * sqrt_lam[:, :, None, :])                # (E, E, d, d)
+        _, log_norm = torch.linalg.slogdet(eye[None, None] + scaled)
+        log_norm = -0.5 * log_norm                                    # (E, E)
+
+        RG = torch.einsum("enp,efpq->efnq", R, G)                     # (E, E, n, d)
+        d_e = (RG * R[:, None, :, :]).sum(-1)                         # (E, E, n)
+        # d_f[e, f, m] = R_f[m] G_ef R_f[m].  Note that m must stay an OUTPUT
+        # index: writing this as an einsum "efnq,fmq->efn" silently sums over
+        # m instead, which produced a wildly wrong covariance.
+        d_f = (RG * R[None, :, :, :]).sum(-1)
+        cross = torch.einsum("efnq,fmq->efnm", RG, R)                 # (E, E, n, n)
+        quad = 0.5 * (d_e[:, :, :, None] + d_f[:, :, None, :] + 2.0 * cross)
+
+        sf2 = self.signal ** 2
+        exponent = (k_n[:, None, :, None] + k_n[None, :, None, :]
+                    + quad + log_norm[:, :, None, None])
+        Lmat = (sf2[:, None, None, None] * sf2[None, :, None, None]
+                * torch.exp(exponent))                                # (E, E, n, n)
+
+        pre = torch.einsum("ne,efnm,mf->ef", beta, Lmat, beta)
+        trace_term = torch.einsum("enn,efnn->ef", iK, Lmat)
+        pre = pre + torch.diag_embed(
+            sf2 - torch.diagonal(trace_term, dim1=0, dim2=1))
+        out_cov = symmetrize(pre) - torch.outer(M, M)
+
+        # ---- input-output regression matrix C_e ---------------------------
+        g = ((beta * ell.transpose(0, 1)).transpose(0, 1)[:, :, None]
+             * (mean[None, None, :] - self.inputs[None, :, :])).sum(1)  # (E, d)
+        cross_c = torch.linalg.solve(B, (iell * g).unsqueeze(-1)).squeeze(-1)
+        cross = (-iell * cross_c).transpose(0, 1)                     # (d, E)
+        return Moments(M, out_cov, cross)
+
     def moments(self, mean: torch.Tensor, cov: torch.Tensor) -> Moments:
+        """Predictive moments at an uncertain input (per-output / per-pair loop).
+
+        This is the *validated* implementation: it agrees with ``gp/gp0d.py`` to
+        ~1e-12.  :meth:`moments_batched` is a partially finished attempt to
+        replace the loops with batched linear algebra; see its docstring.
+        """
         d, E = self.n_in, self.n_out
         dtype, device = mean.dtype, mean.device
         eye = torch.eye(d, dtype=dtype, device=device)
@@ -292,11 +376,11 @@ class GpDynamicsOp(MomentOp):
             k_cols.append(k_n)
             iell_cols.append(iell)
             B_cols.append(B)
-        ell = torch.stack(ell_cols, dim=1)                   # (n, E)
+        ell = torch.stack(ell_cols, dim=1)
         k_n = torch.stack(k_cols, dim=1)
-        M = (beta * ell).sum(0)                              # (E,)
+        M = (beta * ell).sum(0)
 
-        R = []                                               # L_e (X - m)
+        R = []
         for e in range(E):
             Le = torch.diag(iell_cols[e] ** 2)
             R.append((self.inputs - mean[None, :]) @ Le)
@@ -308,13 +392,7 @@ class GpDynamicsOp(MomentOp):
                 lam = iell_cols[e] ** 2 + iell_cols[f] ** 2
                 A = torch.diag(lam)
                 G = torch.linalg.solve(eye + cov @ A, cov)
-                # det(I + A S) with A diagonal and S symmetric; A @ S is not
-                # symmetric, so use the symmetric factorisation
-                # det(I + L^{1/2} S L^{1/2}) which has the same value.
                 log_norm = -0.5 * logdet_psd_scaled_diag(cov, lam, factor=1.0)
-                # exponent = k_n^e + k_m^f + 1/2 d^T G d with
-                # d = L_e(X_n - m) + L_f(X_m - m); the first two pieces are
-                # *diagonal* quantities, only the cross piece is a full matrix.
                 d_e = torch.einsum("nd,de,ne->n", R[e], G, R[e])
                 d_f = torch.einsum("nd,de,ne->n", R[f], G, R[f])
                 cross = torch.einsum("nd,de,me->nm", R[e], G, R[f])
@@ -328,7 +406,6 @@ class GpDynamicsOp(MomentOp):
             rows.append(torch.stack(row))
         out_cov = torch.stack(rows) - torch.outer(M, M)
 
-        cross = torch.zeros(d, E, dtype=dtype, device=device)
         cross_cols = []
         for e in range(E):
             iell = iell_cols[e]

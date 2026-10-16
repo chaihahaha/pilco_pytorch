@@ -163,6 +163,15 @@ class PilcoModel(nn.Module):
         self.proj_op = AffineOp(spec.projection())
 
     # ------------------------------------------------------------------
+    # NOTE: ``torch.compile`` on the one-step map was tried and removed.
+    # Measured on this machine: it produced identical results (cost difference
+    # 0.0) but gave no end-to-end speedup at the ``plan`` level (385 ms compiled
+    # vs 381 ms eager for H=12, excluding the one-off compile cost), and it
+    # crashed in Inductor's C++ backend during the *backward* pass
+    # (``assert mode is None`` in torch/_inductor/codegen/cpp.py) -- which a
+    # try/except around the forward cannot catch, because the backward is
+    # triggered later, inside ``torch.autograd.grad``.  See docs/ARCHITECTURE.md.
+
     def step_augmented(self, mean: torch.Tensor, cov: torch.Tensor,
                        track_jacobian: bool = False):
         """One PILCO step.

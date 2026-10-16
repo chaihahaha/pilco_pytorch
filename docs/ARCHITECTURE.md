@@ -189,6 +189,66 @@ hides:
 
 ---
 
+## 4b. Autograd: the operator-level ledger, and what is still on the table
+
+Section 3 lists the headline substitutions; this is the operator-level ledger and
+the list of things that are *not* yet exploited.
+
+**Autograd replaces, one for one, the derivatives PILCO hand-derived.**  Every
+nonlinearity is a forward-only closed form `(m, S) -> (mean, cov, cross)`; PILCO
+accompanied each with up to nine analytic Jacobians (`dMdm, dSdm, dVdm, dMds,
+dSds, dVds, dMdp, dSdp, dCdp` in `gTrig.m`, `gSat.m`, `gp0d.m`, `lossSat.m`,
+`congp.m`).  Here those are simply not written:
+
+| quantity | PILCO | here |
+| --- | --- | --- |
+| operator derivatives | hand-derived per operator | `torch.autograd` through `splice` |
+| dependence of the mean on the input **covariance** (`dMds`) | hand-derived | free |
+| policy gradient through the whole horizon | `dMdp/dSdp/dCdp` per operator | one `backward()` over `plan` |
+| GP hyper-parameter gradient | `hypCurb` + hand derivative | `backward()` through the Cholesky NLML |
+| one-step mean Jacobian for the cost variance | analytic `dmdm` chain | `torch.func.jacfwd` |
+| optimiser gradients | analytic `df` per objective | `torch.autograd.grad` in `optim/minimize.py` |
+
+That is the main engineering win of the rewrite: adding a nonlinearity means
+writing its moments, not its nine derivatives.  The `MomentOp` contract is
+enforced by the tests (`test_ops_vs_numpy.py` checks each operator against the
+NumPy original, and checks the autograd gradient against finite differences).
+
+**What is not exploited yet**, in rough order of value:
+
+1. **The horizon loop is a Python loop of `H` autograd steps.**  Backward through
+   `H=40` builds a 40-step graph and holds every intermediate.  `torch.func.vjp`,
+   gradient checkpointing, or a custom backward would cut memory and may help
+   speed; none is used.
+2. **No reuse of the GP factorisation between value and gradient.**
+   `_solve_cache` has to be bypassed whenever the hyper-parameters require grad
+   (otherwise the cache would hold a graph), so training recomputes
+   `cholesky(A)` per evaluation.  PILCO's `hypCurb` avoided this by hand-writing
+   the derivative.  A `torch.autograd.Function` with a cached factorisation would
+   recover it.
+3. **No second-order information anywhere.**  `torch.func.hessian` could give the
+   GP a Newton step or the policy a trust region; PILCO's `minimize` needs only
+   gradients, so this is unexplored rather than missing.
+4. **The `O(H^2)` objectives are still Python loops.**  `cost_cross_covariances`
+   and `cumulative_cost_variance` call `cross_moment` once per timestep pair,
+   each building `2N x 2N` matrices.  `expected_kernel_matrix` *was* batched (it
+   was ~97% of the information-gain objective); the others were left alone because
+   the mean/cost-variance path does not need them for speed yet.
+5. **`mean_jacobian` uses `jacfwd`.**  `torch.func.vmap(jacrev(...))` or a batched
+   formulation may be better for larger state dimensions; at `D=4` the current
+   cost is `x4.25` a plain plan, which is why non-variance objectives now skip it
+   entirely (`ExplorationObjective.needs_jacobians`).
+
+**`torch.compile` was tried and removed.**  It compiled and reproduced the eager
+results exactly, but gave no end-to-end speedup at the `plan` level (385 ms vs
+381 ms for `H=12`, excluding the one-off compilation), and it crashed inside
+Inductor's C++ backend during the *backward* pass (`assert mode is None` in
+`torch/_inductor/codegen/cpp.py`) — a failure that a `try/except` around the
+forward cannot catch, because the backward is triggered later inside
+`torch.autograd.grad`.  Since the ported optimiser's own arithmetic is a few small
+vector ops per line search, **the objective dominates and that is where the
+remaining speed is** (see `scripts/diagnostics/profile_hotspots.py`).
+
 ## 5. Validation
 
 | test | what it proves |

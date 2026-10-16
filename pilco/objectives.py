@@ -47,6 +47,7 @@ from .trajectory import PilcoModel, StateSpec, Trajectory
 __all__ = [
     "expected_cumulative_cost", "cumulative_cost_variance",
     "cost_cross_covariances", "information_gain", "expected_kernel_matrix",
+    "expected_kernel_matrix_loop",
     "ucb", "gittins_index", "solve_gittins_lambda_prime",
     "expected_improvement", "probability_of_improvement",
     "ExplorationObjective",
@@ -132,9 +133,44 @@ def expected_kernel_matrix(dynamics, means: torch.Tensor, covs: torch.Tensor,
     ``V = covs[t] + covs[s]``; passing ``cross_covs[t][s] = Cov(z_t, z_s)``
     uses the exact ``V = covs[t] + covs[s] - C - C^T``.  The diagonal ``t = s``
     is exact either way and equals ``sf_e^2``.
+
+    Fully batched over the ``n x n`` pairs: the naive per-pair loop (one
+    Cholesky solve per pair) dominated the information-gain objective, so the
+    batch dimension is ``(t, s)`` here.  The loop version is kept as
+    :func:`expected_kernel_matrix_loop` and the two are checked against each
+    other in ``scripts/diagnostics/vectorisation_check.py``.
     """
     dtype = means.dtype
+    n, d = means.shape
     lam = torch.exp(-2.0 * dynamics.log_lengthscales[:, e])       # 1/ell_e^2
+    eye = torch.eye(d, dtype=dtype, device=means.device)
+
+    delta = means[:, None, :] - means[None, :, :]                 # (n, n, d)
+    V = covs[:, None, :, :] + covs[None, :, :, :]                 # (n, n, d, d)
+    if cross_covs is not None:
+        C = torch.stack([torch.stack([cross_covs[t][s] for s in range(n)])
+                         for t in range(n)])
+        V = V - C - C.transpose(-1, -2)
+    V = symmetrize(V)
+
+    scaled = lam[:, None] * lam[None, :] * V                      # L V L
+    B = eye + scaled                                              # (n, n, d, d)
+    solved = torch.linalg.solve(B, (lam * delta).unsqueeze(-1)).squeeze(-1)
+    quad = -0.5 * (delta * solved).sum(-1)                        # (n, n)
+    _, logabsdet = torch.linalg.slogdet(B)
+    Kbar = dynamics.signal[e] ** 2 * torch.exp(quad - 0.5 * logabsdet)
+    diag = torch.arange(n, device=means.device)
+    Kbar = Kbar.index_put((diag, diag),
+                          torch.full((n,), float(dynamics.signal[e] ** 2),
+                                     dtype=dtype, device=means.device))
+    return Kbar
+
+
+def expected_kernel_matrix_loop(dynamics, means: torch.Tensor,
+                                covs: torch.Tensor, e: int, cross_covs=None):
+    """Reference implementation of :func:`expected_kernel_matrix` (per-pair loop)."""
+    dtype = means.dtype
+    lam = torch.exp(-2.0 * dynamics.log_lengthscales[:, e])
     n = means.shape[0]
     eye = torch.eye(lam.numel(), dtype=dtype, device=means.device)
     Kbar = torch.zeros(n, n, dtype=dtype, device=means.device)
