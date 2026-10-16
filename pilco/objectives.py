@@ -302,6 +302,19 @@ class ExplorationObjective:
     cross_terms: bool = True
     episodes_remaining: int = 10
 
+    @property
+    def needs_jacobians(self) -> bool:
+        """Whether the objective uses the cross-timestep covariance terms.
+
+        Only the analytic cumulative-cost variance needs
+        ``Trajectory.jacobians``; the mean, the information gain and a
+        marginal-variance UCB/Gittins all do not.  ``plan`` computes the
+        Jacobians with ``torch.func.jacfwd``, which costs about as much as the
+        forward pass itself, so requesting them unnecessarily makes policy search
+        roughly 5x slower.
+        """
+        return self.kind in ("ucb", "gittins") and self.cross_terms
+
     def __call__(self, traj: Trajectory, model: PilcoModel) -> torch.Tensor:
         value = expected_cumulative_cost(traj)
         if self.kind == "mean" and self.info_weight == 0.0:

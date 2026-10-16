@@ -135,13 +135,20 @@ pilco/
   (`PilcoConfig.gp_optimizer = policy_optimizer = "pilco"`); with it the GP fit
   matches the reference *exactly* (hyper-parameter max abs diff 0.0000, −NLML
   both −51.2716), which confirms the optimiser was the whole story.
-* **Of the stability guards, only the model-level one can work.**  The step-3
-  acceptance guard (accept the optimised controller only if the model says it is
-  better) was measured: it never fires (`accepted = [1]*8`) and the cost sequence
-  is byte-identical to the unguarded run, because it compares controllers *under
-  the already-degraded model*.  See `PilcoConfig.reject_worse_model` for the
-  guard that instead compares the candidate GP fit against the best-so-far fit on
-  the same controller.
+* **The collapse is explained and fixed.**  It was not a stability problem at
+  all: with `torch.optim.LBFGS` the GP refit lands in a different basin and the
+  loop loses the policy.  Using the ported `minimize`
+  (`gp_optimizer="pilco", policy_optimizer="pilco", legacy_rng=True`) the loop is
+  stable and monotone: **37.9, 28.0, 14.5, 14.0, 13.8, 12.9** over six episodes
+  (against 11.7 then 40.0 for the L-BFGS run).  It settles at ≈12.9 where the
+  NumPy reference settles at ≈8.5, and episode 0 differs because the initial
+  random rollout does not match the reference's seeding exactly — neither is a
+  stability issue.
+* The four stability guards I added are therefore **superseded**: the acceptance
+  guard never fires, the noise floor and shared lengthscales hurt, the
+  lengthscale curb recovers about half the *reproduction* gap, and the
+  model-rejection guard reaches 9.7 but still collapsed.  They are kept as
+  options and as evidence about the failure mechanism.
 
 Diagnosis so far (`scripts/diagnostics/optimiser_parity.py` and the experiments
 in `docs/ARCHITECTURE.md` §8): the divergence is in **GP hyper-parameter

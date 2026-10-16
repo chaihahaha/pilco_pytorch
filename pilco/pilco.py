@@ -219,7 +219,8 @@ def optimise_policy(model: PilcoModel, initial_state: Gaussian, config: PilcoCon
         vec = ParamVector(params)
         evaluate = autograd_objective(
             lambda: objective(plan(model, initial_state, config.horizon,
-                                   with_jacobians=True), model), vec)
+                                   with_jacobians=objective.needs_jacobians),
+                              model), vec)
         res = minimize(vec.flat(), evaluate,
                        length=config.policy_iterations,
                        MFEPLS=config.mfephls)
@@ -239,7 +240,8 @@ def optimise_policy(model: PilcoModel, initial_state: Gaussian, config: PilcoCon
 
     def closure():
         optimiser.zero_grad(set_to_none=True)
-        traj = plan(model, initial_state, config.horizon, with_jacobians=True)
+        traj = plan(model, initial_state, config.horizon,
+                    with_jacobians=objective.needs_jacobians)
         score = objective(traj, model)
         score.backward()
         # autograd can leave a non-contiguous .grad (e.g. from a transpose in the

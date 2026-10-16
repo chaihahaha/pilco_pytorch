@@ -431,7 +431,26 @@ It changes the trajectory and reaches **9.7**, below the reference's own floor �
 so the loop can find a better controller than PILCO's — but it **still collapses**,
 and on this seed the 6-episode total is worse (184.7 vs 167.9).
 
-**Verdict on the three-step route: implemented, measured, and not sufficient.**
+**Stage 6 — with the reference optimiser the collapse disappears.**
+The stability guards were treating a symptom.  Running the loop with
+``gp_optimizer="pilco"``, ``policy_optimizer="pilco"`` and ``legacy_rng=True``
+(same protocol, `H=40`, `gp_iterations=150`, `policy_iterations=150`, seed 0):
+
+| episode | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | --- | --- | --- | --- | --- | --- |
+| realised cost | 37.9 | 28.0 | 14.5 | 14.0 | 13.8 | **12.9** |
+
+Against the same protocol driven by ``torch.optim.LBFGS``, which learned to 11.7
+and then collapsed to 40.0.  The collapse was **entirely** an artefact of the GP
+refit landing in a different basin under a different optimiser; with the
+reference's own ``minimize`` the loop is stable and monotone.
+
+Remaining, smaller gaps on this protocol: it settles at ≈ 12.9 where the NumPy
+reference settles at ≈ 8.5, and episode 0 differs (37.9 vs 76.2) because the
+initial random rollout and controller draw do not match the reference's seeding
+exactly.  Neither is a stability problem.
+
+**Verdict on the three-step route: implemented, measured, and superseded.**
 `results/followup_guards_summary.json` collects the numbers:
 
 | guard | measured verdict |
@@ -441,6 +460,11 @@ and on this seed the 6-episode total is worse (184.7 vs 167.9).
 | shared lengthscales | hurts (38.3) |
 | lengthscale curb `ls_range=3.0` | recovers about half the *reproduction* gap (34.91) |
 | model rejection (step 2c) | changes the trajectory, reaches 9.7, still collapses |
+| **reference optimiser (`gp_optimizer="pilco"`)** | **fixes it — no collapse** |
+
+The guards are all kept as options but none is needed once the optimiser matches;
+they are best read as evidence about *why* the loop was collapsing rather than as
+recommended settings.
 
 The structural reason all model-based guards fail is the same in each case: **the
 model is the oracle the guard consults.** Once the refit has lost the swing-up
