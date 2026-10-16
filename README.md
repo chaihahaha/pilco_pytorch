@@ -139,13 +139,20 @@ pilco/
   all: with `torch.optim.LBFGS` the GP refit lands in a different basin and the
   loop loses the policy.  Using the ported `minimize`
   (`gp_optimizer="pilco", policy_optimizer="pilco", legacy_rng=True`) the loop is
-  stable and monotone across seeds: `37.9 28.0 14.5 14.0 13.8 12.9` (seed 0),
-  `34.8 29.3 14.4 12.7 12.0 **11.6**` (seed 2, inside the NumPy reference's own
-  8.3-12.8 band) and `38.3 35.1 33.3 30.2 26.9 19.5` (seed 1, slower) — against
-  11.7 then 40.0 for the L-BFGS run.  No seed collapses.  Episode 0 differs from
-  the reference because the initial random rollout does not match the reference's
-  seeding exactly, and that cascades; the remaining work is initialisation
-  parity, not stability.
+  stable and monotone across seeds.  Over **12 episodes** seed 0 converges and
+  holds: `37.9 28.0 14.5 14.0 13.8 12.9 12.9 12.8 12.8 12.9 12.8 12.7`; seed 2
+  reaches `10.4` at episode 7 then settles at ~16.7; seed 1 is slower.  Against
+  11.7 then 40.0 for the L-BFGS run.  **No seed collapses.**  Episode 0 differs
+  from the reference because the initial random rollout does not match the
+  reference's seeding exactly, and that cascades; the remaining work is
+  initialisation parity, not stability.
+* **Profile** (`scripts/diagnostics/profile_hotspots.py`): the one-step moment map
+  is ~100% of a planning step (12.4 ms, of which the GP moments are 13.7 ms), and
+  `jacfwd` costs `x5.46` on top, which is why non-variance objectives now skip it.
+  The `information_gain` objective was **444.8 ms and is now 1.47 ms (~300x)**
+  after batching `expected_kernel_matrix` over the query pairs.
+  `cumulative_cost_variance` is the remaining hotspot at 706 ms (122% of a plain
+  plan) and is the obvious next target.
 * The four stability guards I added are therefore **superseded**: the acceptance
   guard never fires, the noise floor and shared lengthscales hurt, the
   lengthscale curb recovers about half the *reproduction* gap, and the

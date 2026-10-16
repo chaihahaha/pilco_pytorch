@@ -240,14 +240,40 @@ NumPy original, and checks the autograd gradient against finite differences).
    entirely (`ExplorationObjective.needs_jacobians`).
 
 **`torch.compile` was tried and removed.**  It compiled and reproduced the eager
-results exactly, but gave no end-to-end speedup at the `plan` level (385 ms vs
-381 ms for `H=12`, excluding the one-off compilation), and it crashed inside
+results exactly, and it did speed the isolated step up (6.54 ms vs 12.43 ms eager,
+**1.90x**), but no end-to-end speedup showed up at the `plan` level once the
+one-off compilation was excluded, and it crashed inside
 Inductor's C++ backend during the *backward* pass (`assert mode is None` in
 `torch/_inductor/codegen/cpp.py`) — a failure that a `try/except` around the
 forward cannot catch, because the backward is triggered later inside
-`torch.autograd.grad`.  Since the ported optimiser's own arithmetic is a few small
+`torch.autograd.grad`.  Given that it did not pay off end-to-end, the crash was
+enough to remove it.  Since the ported optimiser's own arithmetic is a few small
 vector ops per line search, **the objective dominates and that is where the
 remaining speed is** (see `scripts/diagnostics/profile_hotspots.py`).
+
+### Measured profile and the one vectorisation that mattered
+
+Clean-machine profile (`profile_hotspots.py`, `H=40`, 200 GP points)::
+
+    one step_augmented          :  12.43 ms   <- ~100% of a planning step
+      (of which GP moments)     :  13.67 ms
+    plan H=40 (no Jacobians)    : 578.63 ms   (14.47 ms/step)
+    plan H=40 (with Jacobians)  : 3160.50 ms  (jacfwd overhead x5.46)
+    objective mean              :      7.6 us
+    objective cost variance     : 706.54 ms   (122% of a plain plan)
+    objective information gain  :   1.47 ms   <- was 444.82 ms
+
+Vectorising `expected_kernel_matrix` over the `H x H` query pairs (one batched
+solve + `slogdet` instead of one Cholesky solve per pair) cut the information-gain
+objective from **444.8 ms to 1.47 ms, about 300x**, and
+`expected_kernel_matrix` itself from 108 ms to 0.32 ms per output.  It was ~97% of
+that objective.  That is the single highest-leverage change in this repository for
+anyone using information gain as the exploration criterion.
+
+The remaining hotspot on the exploration path is
+`cumulative_cost_variance` at 706 ms (122% of a plain plan): it calls
+`cross_moment` once per timestep *pair*, each building `2N x 2N` matrices.  That is
+the obvious next vectorisation, and it is not done.
 
 ## 5. Validation
 
@@ -514,9 +540,22 @@ Across seeds (`results/cartpole_faithful_seeds.json`):
 | 2 | 34.8 | 29.3 | 14.4 | 12.7 | 12.0 | **11.6** |
 | NumPy reference (faithful protocol) | 76.2 | 12.6 | 8.6 | 8.4 | 12.8 | — |
 
+Twelve episodes (`results/cartpole_faithful_12ep.json`):
+
+| seed | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 37.9 | 28.0 | 14.5 | 14.0 | 13.8 | 12.9 | 12.9 | 12.8 | 12.8 | 12.9 | 12.8 | **12.7** |
+| 2 | 34.8 | 29.3 | 14.4 | 12.7 | 12.0 | 11.6 | 10.4 | 15.4 | 15.0 | 16.9 | 16.9 | **16.6** |
+
+**Seed 0 converges and holds**: from episode 6 to 12 the realised cost stays within
+0.2 of 12.8.  Seed 2 reaches the best value of any run (10.4 at episode 7) but then
+drifts up to ~16.7 and holds there.  Neither collapses; the previous fall back to
+the 40.0 ceiling is gone.  The reference's own floor is ~8.5, so the loop converges
+to a *working but slightly worse* swing-up controller on these seeds.
+
 So: every seed learns monotonically and **none collapses**; seed 2 lands inside
-the reference's own 8.3-12.8 band; seed 1 is slower and still descending at
-episode 6.  Episode 0 differs from the reference (34.8-38.3 vs 76.2) because the
+the reference's own 8.3-12.8 band early on; seed 1 is slower and still descending
+at episode 6.  Episode 0 differs from the reference (34.8-38.3 vs 76.2) because the
 initial random rollout and controller draw do not match the reference's seeding
 exactly, and that difference cascades through the closed loop.  The remaining
 work is therefore *initialisation parity*, not stability or correctness.
