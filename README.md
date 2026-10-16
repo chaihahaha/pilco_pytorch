@@ -130,8 +130,11 @@ pilco/
   stops at*: NumPy's `minimize` halts at a much smoother model
   (log-lengthscales up to 5.95) than a converged fit (2.73), and on 40 data
   points the smoother model controls better (policy value 33.85 vs 35.80).
-  Autograd drift is ruled out.  Tightening the lengthscale curb
-  (`PilcoConfig.ls_range=3.0`) recovers about half the gap (34.91).
+  Autograd drift is ruled out.  **PILCO's own `minimize` is now ported to
+  PyTorch** (`pilco/optim/minimize.py`) and used by default
+  (`PilcoConfig.gp_optimizer = policy_optimizer = "pilco"`); with it the GP fit
+  matches the reference *exactly* (hyper-parameter max abs diff 0.0000, −NLML
+  both −51.2716), which confirms the optimiser was the whole story.
 * **Of the stability guards, only the model-level one can work.**  The step-3
   acceptance guard (accept the optimised controller only if the model says it is
   better) was measured: it never fires (`accepted = [1]*8`) and the cost sequence

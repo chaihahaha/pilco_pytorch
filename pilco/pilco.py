@@ -24,7 +24,8 @@ import numpy as np
 import torch
 
 from .gaussian import Gaussian
-from .models.gp import build_dynamics_op, fit_hyperparameters, initial_log_hyp
+from .models.gp import (build_dynamics_op, fit_hyperparameters,
+                       fit_hyperparameters_pilco, initial_log_hyp)
 from .objectives import ExplorationObjective
 from .ops.policy import RbfPolicyOp
 from .trajectory import PilcoModel, plan
@@ -110,6 +111,18 @@ class PilcoConfig:
     #: of the gap, but the response is not monotonic, so it is an option
     #: rather than a default (see docs/ARCHITECTURE.md section 8).
     ls_range: Optional[float] = None
+    #: Which optimiser to use.  ``"pilco"`` is the PyTorch port of
+    #: PILCO's MATLAB-style ``minimize`` (``pilco/optim/minimize.py``);
+    #: ``"lbfgs"`` is ``torch.optim.LBFGS`` with a strong-Wolfe line search.
+    #: They are NOT interchangeable: counted in line searches with
+    #: ``MFEPLS`` evaluations each, PILCO's ``minimize`` does far less work
+    #: than ``LBFGS(max_iter=N)``, and on small datasets that difference
+    #: decides whether the GP stays smooth enough for the planner to trust.
+    #: Reproducing ``pilco_python`` requires ``"pilco"``.
+    gp_optimizer: str = "pilco"
+    policy_optimizer: str = "pilco"
+    #: Function evaluations allowed per line search (PILCO's ``MFEPLS``).
+    mfephls: int = 30
 
 
 @dataclass
@@ -179,13 +192,36 @@ def make_model(scenario, inputs: torch.Tensor, targets: torch.Tensor,
 def optimise_policy(model: PilcoModel, initial_state: Gaussian, config: PilcoConfig,
                     objective: ExplorationObjective,
                     verbose: bool = False) -> tuple[float, float]:
-    """L-BFGS on the controller parameters.  Returns the objective value."""
+    """Optimise the controller parameters.  Returns the objective value.
+
+    Uses the same optimiser family as the GP fit (see
+    :attr:`PilcoConfig.policy_optimizer`), so that a comparison against
+    ``pilco_python`` does not mix optimiser differences with model differences.
+    """
     params = [model.policy.centers, model.policy.targets,
               model.policy.log_lengthscales]
     gp_params = [model.dynamics.log_lengthscales, model.dynamics.log_signal,
                  model.dynamics.log_noise]
     for p in gp_params:
         p.requires_grad_(False)
+
+    if config.policy_optimizer == "pilco":
+        from .optim.minimize import ParamVector, autograd_objective, minimize
+
+        vec = ParamVector(params)
+        evaluate = autograd_objective(
+            lambda: objective(plan(model, initial_state, config.horizon,
+                                   with_jacobians=True), model), vec)
+        res = minimize(vec.flat(), evaluate,
+                       length=config.policy_iterations,
+                       MFEPLS=config.mfephls)
+        vec.set(res.x)
+        for p in gp_params:
+            p.requires_grad_(True)
+        if verbose:
+            print(f"    policy: {len(res.fX)} line searches, "
+                  f"objective {res.final:.4f}")
+        return res.final, len(res.fX)
 
     optimiser = torch.optim.LBFGS(params, lr=1.0,
                                   max_iter=config.policy_iterations,
@@ -264,9 +300,15 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
     for episode in range(config.episodes):
         model = make_model(scenario, inputs, targets, policy, log_hyp)
         previous_hyp = log_hyp.clone()
-        fit_hyperparameters(model.dynamics, iterations=config.gp_iterations,
-                            noise_floor=config.noise_floor,
-                            ls_range=config.ls_range)
+        if config.gp_optimizer == "pilco":
+            fit_hyperparameters_pilco(model.dynamics,
+                                      iterations=config.gp_iterations,
+                                      MFEPLS=config.mfephls,
+                                      ls_range=config.ls_range)
+        else:
+            fit_hyperparameters(model.dynamics, iterations=config.gp_iterations,
+                                noise_floor=config.noise_floor,
+                                ls_range=config.ls_range)
         # --- Step 2: bound how far one episode may reshape the model --------
         if config.hyperparameter_trust_region > 0.0:
             with torch.no_grad():

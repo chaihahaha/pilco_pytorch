@@ -45,7 +45,8 @@ from pilco_python.gp.train import train as gp_train                       # noqa
 from pilco_python.gp.gp1d import gp1d                                     # noqa: E402
 
 from pilco.gaussian import Gaussian                                       # noqa: E402
-from pilco.models.gp import fit_hyperparameters                           # noqa: E402
+from pilco.models.gp import (fit_hyperparameters,                         # noqa: E402
+                             fit_hyperparameters_pilco)
 from pilco.objectives import ExplorationObjective                         # noqa: E402
 from pilco.ops.gp import GpDynamicsOp                                     # noqa: E402
 from pilco.ops.policy import RbfPolicyOp                                  # noqa: E402
@@ -70,7 +71,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon", type=int, default=40)
     ap.add_argument("--bfgs", type=int, default=40)
-    ap.add_argument("--gp-iter", type=int, default=80)
+    ap.add_argument("--gp-iter", type=int, default=150)
+    ap.add_argument("--optimizer", default="pilco", choices=["pilco", "lbfgs"])
     args = ap.parse_args()
     H = args.horizon
 
@@ -116,7 +118,11 @@ def main() -> int:
     print(f"   numpy  log ell[out0] = {np.round(np.asarray(dm['hyp'])[:d_poli,0], 4)}")
     print(f"   numpy  -NLML total   = {_np_nlml(dm):.4f}")
     with contextlib.redirect_stdout(io.StringIO()):
-        fit_hyperparameters(model.dynamics, iterations=args.gp_iter)
+        if args.optimizer == "pilco":
+            fit_hyperparameters_pilco(model.dynamics, iterations=args.gp_iter,
+                                      MFEPLS=30)
+        else:
+            fit_hyperparameters(model.dynamics, iterations=args.gp_iter)
     print(f"   torch  log ell[out0] = "
           f"{np.round(model.dynamics.log_lengthscales.detach().numpy()[:d_poli,0], 4)}")
     print(f"   torch  -NLML total   = {float(model.dynamics.nlml()):.4f}")
@@ -134,7 +140,9 @@ def main() -> int:
                                mu0Sim, S0Sim, dm, pol_np, plant, cost, H)
     # torch, but with the *numpy* GP so only the optimiser differs
     model.dynamics.set_log_hyp(torch.as_tensor(np.asarray(dm["hyp"])))
-    cfg = PilcoConfig(horizon=H, policy_iterations=args.bfgs)
+    cfg = PilcoConfig(horizon=H, policy_iterations=args.bfgs,
+                      gp_optimizer=args.optimizer,
+                      policy_optimizer=args.optimizer)
     with contextlib.redirect_stdout(io.StringIO()):
         j_opt, n = optimise_policy(model, x0, cfg,
                                    ExplorationObjective(kind="mean"))

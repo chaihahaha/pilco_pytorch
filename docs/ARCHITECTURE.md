@@ -337,6 +337,28 @@ same 1.73), and at 40 data points the smoother model yields the better policy.
 `ls_range=3.0` recovers about half of the gap; the response is not monotonic, so
 it is exposed as an option (`PilcoConfig.ls_range`) rather than a default.
 
+**Stage 5 — removing the optimiser as a variable closes the gap.**
+PILCO's ``minimize`` is now ported to PyTorch (``pilco/optim/minimize.py``,
+BFGS + cubic line search + Wolfe-Powell, ``length`` counted in line searches with
+``MFEPLS`` evaluations each), and ``minimize_port_check.py`` validates it against
+the NumPy original on the same objective from the same start: the analytic
+quadratic traces match to 0.0, and on the real curbed GP marginal likelihood the
+two converge to the *same* point (final value identical to 1e-12,
+hyper-parameters to 1.4e-8; the traces differ mid-flight by 1.4e-6 because the
+autograd gradient differs from the analytic one at the 1e-9 level, which can flip
+a line-search decision).
+
+Wiring it in as ``gp_optimizer="pilco"`` makes the fit match the reference
+exactly::
+
+    numpy  log ell[out0] = [5.1506 2.0613 5.9450 2.9242 3.6780]   -NLML -51.2716
+    torch  log ell[out0] = [5.1506 2.0613 5.9450 2.9242 3.6780]   -NLML -51.2716
+    hyper-parameter max abs diff = 0.0000
+
+So the divergence really was the optimiser, and it is now a controlled variable
+(``PilcoConfig.gp_optimizer`` / ``policy_optimizer``, both defaulting to
+``"pilco"``; ``"lbfgs"`` selects ``torch.optim.LBFGS``).
+
 **Conclusion.**  The model layer is correct, the loop can learn, and the
 remaining divergence is *a stopping rule*: PILCO's weak MATLAB-style `minimize`
 halts at a smooth, slightly under-fitted GP, and at this data size that happens
