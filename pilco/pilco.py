@@ -142,7 +142,8 @@ class EpisodeLog:
 
 
 def initial_policy(scenario, initial_state: Gaussian, n_basis: int,
-                   generator: torch.Generator) -> RbfPolicyOp:
+                   generator: torch.Generator,
+                   legacy: bool = False) -> RbfPolicyOp:
     """Initialise the controller the way ``settings_cp.m`` does.
 
     PILCO draws the pseudo-inputs from the *prior state distribution pushed
@@ -168,10 +169,17 @@ def initial_policy(scenario, initial_state: Gaussian, n_basis: int,
     mean = aug_mean[poli]
     cov = aug_cov[poli][:, poli]
     L = torch.linalg.cholesky(cov + 1e-10 * torch.eye(len(poli), dtype=DTYPE))
-    z = torch.randn(len(poli), n_basis, dtype=DTYPE, generator=generator)
+    if legacy:
+        # match `pilco_python.util.gaussian` exactly: m + L @ np.random.randn(D, n),
+        # then 0.1 * np.random.randn(n, Du)
+        z = torch.as_tensor(np.random.randn(len(poli), n_basis))
+        targets = 0.1 * torch.as_tensor(
+            np.random.randn(n_basis, spec.control_dim))
+    else:
+        z = torch.randn(len(poli), n_basis, dtype=DTYPE, generator=generator)
+        targets = 0.1 * torch.randn(n_basis, spec.control_dim, dtype=DTYPE,
+                                    generator=generator)
     centers = (mean[:, None] + L @ z).transpose(0, 1)          # (n_basis, d_poli)
-    targets = 0.1 * torch.randn(n_basis, spec.control_dim, dtype=DTYPE,
-                                generator=generator)
     default_ell = torch.tensor([1.0, 1.0, 1.0, 0.7, 0.7], dtype=DTYPE)
     ell = default_ell[:len(poli)] if len(poli) == default_ell.numel() \
         else torch.ones(len(poli), dtype=DTYPE)
@@ -290,7 +298,8 @@ def learn(scenario, config: Optional[PilcoConfig] = None,
     inputs = torch.as_tensor(np.vstack(inputs_np), dtype=DTYPE)
     targets = torch.as_tensor(np.vstack(targets_np), dtype=DTYPE)
 
-    policy = initial_policy(scenario, initial_state, scenario.n_basis, generator)
+    policy = initial_policy(scenario, initial_state, scenario.n_basis,
+                            generator, legacy=config.legacy_rng)
     log_hyp = initial_log_hyp(inputs, targets)
 
     logs: list[EpisodeLog] = []

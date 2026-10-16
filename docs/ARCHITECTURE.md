@@ -359,6 +359,18 @@ So the divergence really was the optimiser, and it is now a controlled variable
 (``PilcoConfig.gp_optimizer`` / ``policy_optimizer``, both defaulting to
 ``"pilco"``; ``"lbfgs"`` selects ``torch.optim.LBFGS``).
 
+For a fully faithful end-to-end comparison set ``PilcoConfig.legacy_rng=True`` as
+well: that routes the process noise *and* the controller's initial random draws
+through NumPy's legacy global stream (``np.random.seed`` / ``np.random.randn``),
+matching ``util/gaussian.py`` and ``base/rollout.py`` draw for draw.  Without it
+the two loops see different noise and their trajectories diverge for reasons that
+have nothing to do with the maths.
+
+```python
+PilcoConfig(horizon=40, episodes=6, gp_iterations=150, policy_iterations=150,
+            gp_optimizer="pilco", policy_optimizer="pilco", legacy_rng=True)
+```
+
 **Conclusion.**  The model layer is correct, the loop can learn, and the
 remaining divergence is *a stopping rule*: PILCO's weak MATLAB-style `minimize`
 halts at a smooth, slightly under-fitted GP, and at this data size that happens
