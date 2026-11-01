@@ -1,31 +1,48 @@
 """Hyper-parameter training for the dynamics GP.
 
-Replaces ``gp/train.py`` + ``gp/hypCurb.py``.  Because
-:class:`~pilco.ops.gp.GpDynamicsOp` exposes its negative log marginal likelihood
-as a differentiable function of the log-hyper-parameters, training is just a
-``torch.optim.LBFGS`` call.  The original code needed a hand-derived gradient of
-the NLML and a separate MATLAB-style ``minimize`` with a custom line search.
+Replaces ``gp/train.py`` + ``gp/hypCurb.py``.  The negative log marginal
+likelihood comes from GPyTorch (:meth:`~pilco.ops.gp.GpDynamicsOp.nlml`), so
+training is a plain optimiser call over the GP's own parameters; the original
+code needed a hand-derived NLML gradient and its own MATLAB-style ``minimize``.
 
-PILCO's "hyper-parameter curb" (bound the signal-to-noise ratio and the
-lengthscales) is implemented as a projection applied inside the LBFGS closure,
-which keeps the optimiser on the feasible set without adding penalty terms.
+Two trainers are provided, because they are not interchangeable:
+
+``fit_hyperparameters``
+    ``torch.optim.LBFGS`` with a strong-Wolfe line search, over all outputs at
+    once.  Fast, but does far more work per iteration than PILCO's optimiser.
+
+``fit_hyperparameters_pilco``
+    The ported ``minimize``, one output at a time, exactly like ``gp/train.py``.
+    This is what reproduces the NumPy reference, and on small datasets it is
+    also what keeps the fit smooth enough for the planner to trust.
+
+Both optimise the same object, and both apply PILCO's *curb*: a sharp
+``p = 30`` penalty that pulls each ARD lengthscale towards the spread of its
+input column and bounds the signal-to-noise ratio.  It is a penalty rather than
+a clamp because the reference adds it to the NLML before calling ``minimize``.
 """
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence
+from typing import Optional
 
+import gpytorch
 import torch
 
-from ..ops.gp import GpDynamicsOp, _robust_cholesky
+from ..ops.gp import GpDynamicsOp
 
-__all__ = ["initial_log_hyp", "fit_hyperparameters", "build_dynamics_op"]
+__all__ = ["initial_log_hyp", "curbed_nlml", "fit_hyperparameters",
+           "fit_hyperparameters_pilco", "build_dynamics_op",
+           "LOG_ELL_MIN", "LOG_ELL_MAX", "SNR_MAX"]
 
 LOG_ELL_MIN = math.log(1e-2)
 LOG_ELL_MAX = math.log(1e2)
 SNR_MAX = 1000.0
 
 
+# ---------------------------------------------------------------------------
+# initialisation
+# ---------------------------------------------------------------------------
 def initial_log_hyp(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """PILCO's heuristic initialisation of ``hyp`` (see ``gp/train.py``).
 
@@ -44,11 +61,10 @@ def initial_log_hyp(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor
 
 
 def _curb(log_hyp: torch.Tensor) -> torch.Tensor:
-    """PILCO's hyper-parameter constraints (lengthscales and SNR)."""
+    """Clamp a ``(d + 2, E)`` hyper-parameter tensor to PILCO's feasible set."""
     d = log_hyp.shape[0] - 2
     out = log_hyp.clone()
     out[:d] = out[:d].clamp(LOG_ELL_MIN, LOG_ELL_MAX)
-    # log noise std <= log signal std - log(SNR_MAX)
     out[d + 1] = torch.minimum(out[d + 1], out[d] - math.log(SNR_MAX))
     return out
 
@@ -62,48 +78,53 @@ def build_dynamics_op(inputs: torch.Tensor, targets: torch.Tensor,
     return GpDynamicsOp.from_log_hyp(inputs, targets, log_hyp)
 
 
-def curbed_nlml(op: GpDynamicsOp, input_std: torch.Tensor,
-                ls_max: float = 100.0, snr_max: float = SNR_MAX,
-                power: float = 30.0,
-                ls_range: Optional[float] = None) -> torch.Tensor:
-    """PILCO's curbed negative log marginal likelihood (``gp/hypCurb.py``).
+# ---------------------------------------------------------------------------
+# the curb penalty
+# ---------------------------------------------------------------------------
+def _curb_penalty(op: GpDynamicsOp, input_std: torch.Tensor,
+                  ls_range: Optional[float] = None,
+                  power: float = 30.0) -> torch.Tensor:
+    """PILCO's ``p = 30`` penalty on the lengthscales and the SNR, all outputs.
 
-    The original does not *clamp* the hyper-parameters, it adds a sharp
-    (``p = 30``) **penalty** to the NLML:
-
-    * ``sum(((ll - log std(inputs)) / log 100) ** 30)`` pulls each ARD
-      lengthscale towards the standard deviation of the corresponding input
-      column -- a strong regulariser;
+    * ``sum(((log ell - log std(inputs)) / log 100) ** 30)`` pulls each ARD
+      lengthscale towards the spread of its input column -- a strong regulariser;
     * ``sum(((log sf - log sigma_n) / log 1000) ** 30)`` bounds the
       signal-to-noise ratio.
 
-    Omitting the first term matters a lot in practice.  An uncurbed L-BFGS on
-    the same 40-point cart-pole dataset used by the NumPy reference drives the
-    noise standard deviation to ~1e-4 and the NLML *below* the reference's
-    optimum, i.e. it fits the sampled process noise; the resulting overconfident
-    model then misleads policy search and the closed loop fails to learn
-    cart-pole (episode cost 36/40 instead of ~9).  Reproducing the penalty makes
-    the two trainers agree and the loop learn.
+    Omitting the first term matters in practice.  An uncurbed fit on the 40-point
+    cart-pole dataset drives the noise standard deviation to ~1e-4, i.e. it fits
+    the sampled process noise; the resulting overconfident model then misleads
+    policy search and the closed loop fails to learn (episode cost 36/40 instead
+    of ~9).  ``ls_range`` is a tighter alternative to PILCO's own ``log 100``:
+    the *smoothness* of the GP, not just its marginal likelihood, decides whether
+    the planner can trust it (see ``docs/ARCHITECTURE.md`` section 8).
     """
-    f = op.nlml()
+    return sum(_curb_penalty_single(op, e, input_std, ls_range, power)
+               for e in range(op.n_out))
+
+
+def _curb_penalty_single(op: GpDynamicsOp, e: int, input_std: torch.Tensor,
+                         ls_range: Optional[float], power: float = 30.0
+                         ) -> torch.Tensor:
+    """The penalty for output ``e``."""
     std = torch.as_tensor(input_std, dtype=op.log_lengthscales.dtype).reshape(-1)
     if std.numel() == 1:
         std = std.expand(op.log_lengthscales.shape[0])
-    ll = op.log_lengthscales
-    # ``ls_max`` reproduces PILCO's own curb; ``ls_range`` (in log units) is a
-    # tighter alternative that keeps the lengthscale within ``exp(ls_range)`` of
-    # the input spread.  It matters because the *smoothness* of the GP, not just
-    # its marginal likelihood, decides whether the planner can trust it: on the
-    # 40-point cart-pole dataset the reference's fit sits at log-lengthscales
-    # [5.15, 2.06, 5.95, 2.92, 3.68] (a very smooth model) while an unconstrained
-    # fit goes to [2.73, 1.15, 2.54, 0.002, 2.72], and the smooth model yields a
-    # 6% better policy value.
-    scale = (math.log(ls_max) if ls_range is None else float(ls_range))
-    f = f + (((ll - torch.log(std.clamp(min=1e-6))[:, None]) / scale) ** power).sum()
-    f = f + (((op.log_signal - op.log_noise) / math.log(snr_max)) ** power).sum()
-    return f
+    scale = math.log(100.0) if ls_range is None else float(ls_range)
+    ll = op.log_lengthscales[:, e] - torch.log(std.clamp(min=1e-6))
+    snr = (op.log_signal[e] - op.log_noise[e]) / math.log(SNR_MAX)
+    return (ll / scale).pow(power).sum() + snr.pow(power)
 
 
+def curbed_nlml(op: GpDynamicsOp, input_std: torch.Tensor,
+                ls_range: Optional[float] = None) -> torch.Tensor:
+    """``nlml + curb`` -- what PILCO actually minimises over the hyper-parameters."""
+    return op.nlml() + _curb_penalty(op, input_std, ls_range)
+
+
+# ---------------------------------------------------------------------------
+# trainer 1: all outputs at once, torch LBFGS
+# ---------------------------------------------------------------------------
 def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
                         tolerance: float = 1e-8,
                         verbose: bool = False,
@@ -121,7 +142,7 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
         Maximum number of L-BFGS iterations.
     use_curb:
         Apply PILCO's sharp penalty on the lengthscales and the SNR (see
-        :func:`curbed_nlml`).  Disabling it is useful for experiments but lets
+        :func:`_curb_penalty`).  Disabling it is useful for experiments but lets
         the fit run away on small datasets.
     noise_floor:
         Lower bound on the observation-noise standard deviation.  Motivation:
@@ -138,17 +159,24 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
         lengthscales.  It is kept as an option because it is the right knob for a
         genuinely noisy plant, but it is not the fix for the closed-loop gap.
     """
-    params = [op.log_lengthscales, op.log_signal, op.log_noise]
+    params = op.hyperparameters()
     input_std = torch.std(op.inputs, dim=0)
 
     def project():
-        """Keep the hyper-parameters on PILCO's feasible set."""
+        """Keep the hyper-parameters on PILCO's feasible set.
+
+        Writing through every model is idempotent, so the shared-lengthscale case
+        needs no special handling.
+        """
         with torch.no_grad():
-            op.log_lengthscales.clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
-            op.log_noise.copy_(torch.minimum(
-                op.log_noise, op.log_signal - math.log(SNR_MAX)))
-            if noise_floor > 0.0:
-                op.log_noise.clamp_(min=math.log(noise_floor))
+            for model in op.models:
+                model.covar_module.base_kernel.raw_lengthscale.clamp_(
+                    LOG_ELL_MIN, LOG_ELL_MAX)
+                model.likelihood.raw_noise.copy_(torch.minimum(
+                    model.likelihood.raw_noise,
+                    model.covar_module.raw_outputscale - 2.0 * math.log(SNR_MAX)))
+                if noise_floor > 0.0:
+                    model.likelihood.raw_noise.clamp_(min=2.0 * math.log(noise_floor))
 
     project()
     optimiser = torch.optim.LBFGS(params, lr=1.0, max_iter=iterations,
@@ -180,51 +208,10 @@ def fit_hyperparameters(op: GpDynamicsOp, iterations: int = 300,
               f"({len(history)} evals)")
     return op
 
+
 # ---------------------------------------------------------------------------
-# Per-output training with PILCO's own optimiser
+# trainer 2: one output at a time, PILCO's own minimise
 # ---------------------------------------------------------------------------
-def gp_nlml(inputs: torch.Tensor, targets: torch.Tensor,
-            log_lengthscales: torch.Tensor, log_signal: torch.Tensor,
-            log_noise: torch.Tensor,
-            individual_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Negative log marginal likelihood for a *single* output.
-
-    Equivalent to ``GpDynamicsOp.nlml()`` restricted to one column, but written
-    as a free function of the hyper-parameters so PILCO's per-output optimisation
-    (``gp/train.py`` loops over outputs and calls ``minimize`` separately) can be
-    reproduced exactly.
-    """
-    iell = torch.exp(-log_lengthscales)                     # (d,)
-    diff = (inputs[:, None, :] - inputs[None, :, :]) * iell
-    K = torch.exp(2.0 * log_signal) * torch.exp(-0.5 * (diff ** 2).sum(-1))
-    n = inputs.shape[0]
-    A = K + torch.exp(2.0 * log_noise) * torch.eye(n, dtype=K.dtype,
-                                                   device=K.device)
-    if individual_noise is not None:
-        A = A + torch.diag(individual_noise)
-    L = _robust_cholesky(A)
-    alpha = torch.cholesky_solve(targets.unsqueeze(-1), L).squeeze(-1)
-    return (0.5 * (targets @ alpha) + torch.log(torch.diagonal(L)).sum()
-            + 0.5 * n * math.log(2 * math.pi))
-
-
-def curbed_gp_nlml(inputs, targets, log_lengthscales, log_signal, log_noise,
-                   input_std, ls_max: float = 100.0, snr_max: float = SNR_MAX,
-                   power: float = 30.0, ls_range: Optional[float] = None,
-                   individual_noise=None) -> torch.Tensor:
-    """PILCO's curbed NLML for one output (see :func:`curbed_nlml`)."""
-    f = gp_nlml(inputs, targets, log_lengthscales, log_signal, log_noise,
-                individual_noise)
-    std = torch.as_tensor(input_std, dtype=log_lengthscales.dtype).reshape(-1)
-    if std.numel() == 1:
-        std = std.expand(log_lengthscales.numel())
-    scale = math.log(ls_max) if ls_range is None else float(ls_range)
-    f = f + (((log_lengthscales - torch.log(std.clamp(min=1e-6))) / scale)
-             ** power).sum()
-    f = f + (((log_signal - log_noise) / math.log(snr_max)) ** power).sum()
-    return f
-
-
 def fit_hyperparameters_pilco(op: GpDynamicsOp, iterations: int = 150,
                               MFEPLS: int = 30, power: float = 30.0,
                               ls_range: Optional[float] = None,
@@ -236,35 +223,37 @@ def fit_hyperparameters_pilco(op: GpDynamicsOp, iterations: int = 150,
     :mod:`pilco.optim.minimize`.  Using the reference optimiser is what makes the
     GP fit land in the reference's basin (see
     ``scripts/diagnostics/reproduction_check.py``).
+
+    The objective is GPyTorch's marginal likelihood (:meth:`GpDynamicsOp.nlml`
+    restricted to one output) plus the curb.  Because the per-output GP's raw
+    parameters *are* the log hyper-parameters, ``minimize`` sees exactly the
+    coordinates it saw in the reference implementation.
     """
     from ..optim.minimize import ParamVector, autograd_objective, minimize
 
     input_std = torch.std(op.inputs, dim=0)
-    dtype = op.inputs.dtype
-    for e in range(op.n_out):
-        log_ell = torch.nn.Parameter(op.log_lengthscales[:, e].detach().clone())
-        log_sf = torch.nn.Parameter(op.log_signal[e].detach().clone().reshape(()))
-        log_sn = torch.nn.Parameter(op.log_noise[e].detach().clone().reshape(()))
-        vec = ParamVector([log_ell, log_sf, log_sn])
-        nigp = (op.individual_noise[:, e] if op.individual_noise.any() else None)
-        evaluate = autograd_objective(
-            lambda: curbed_gp_nlml(op.inputs, op.targets[:, e], log_ell, log_sf,
-                                   log_sn, input_std, power=power,
-                                   ls_range=ls_range, individual_noise=nigp),
-            vec)
+    n = op.inputs.shape[0]
+    for e, model in enumerate(op.models):
+        params = [model.covar_module.base_kernel.raw_lengthscale,
+                  model.covar_module.raw_outputscale,
+                  model.likelihood.raw_noise]
+        vec = ParamVector(params)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
+
+        def objective(model=model, mll=mll, e=e):
+            # GPyTorch's MLL is per data point, hence the factor ``n``.
+            return (-n * mll(model(op.inputs), op.targets[:, e])
+                    + _curb_penalty_single(op, e, input_std, ls_range, power))
+
         # seed the optimiser from the current hyper-parameters, exactly like
-        # PILCO (lh[:, i] is warm-started across episodes)
+        # PILCO (``lh[:, i]`` is warm-started across episodes)
         with torch.no_grad():
-            log_ell.clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
-        res = minimize(vec.flat(), evaluate, length=iterations, MFEPLS=MFEPLS)
+            params[0].clamp_(LOG_ELL_MIN, LOG_ELL_MAX)
+        res = minimize(vec.flat(), autograd_objective(objective, vec),
+                       length=iterations, MFEPLS=MFEPLS)
         vec.set(res.x)
-        with torch.no_grad():
-            op.log_lengthscales[:, e].copy_(log_ell.detach())
-            op.log_signal[e].copy_(log_sf.detach())
-            op.log_noise[e].copy_(log_sn.detach())
         op.invalidate_cache()
         if verbose:
             print(f"  GP {e + 1}/{op.n_out}: {len(res.fX)} line searches, "
                   f"NLML {res.fX[0]:.6e} -> {res.final:.6e}")
-    del dtype
     return op

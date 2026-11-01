@@ -49,12 +49,11 @@ torch.set_default_dtype(torch.float64)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt                              # noqa: E402
-from matplotlib.patches import Circle, FancyArrowPatch, Rectangle  # noqa: E402
+from matplotlib.patches import Circle, Rectangle                 # noqa: E402
 from scipy.integrate import solve_ivp                        # noqa: E402
 
 from pilco.pilco import PilcoConfig, learn                   # noqa: E402
-from pilco.scenarios.cartpole import (DTYPE, cartpole_dynamics,  # noqa: E402
-                                      make_cartpole)
+from pilco.scenarios.cartpole import cartpole_dynamics, make_cartpole  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +127,10 @@ class Controller:
         A = K + (self.noise ** 2) * np.eye(c.shape[0])
         self.beta = np.linalg.solve(A, self.targets)
         if "beta" in d:
+            # sanity check only: numpy and torch solve the same system with
+            # different pivoting, so agreement is ~1e-12 relative, not exact
             err = np.max(np.abs(self.beta - np.asarray(d["beta"])))
-            if err > 1e-10:
+            if err > 1e-8:
                 raise RuntimeError(f"beta mismatch against the cached value: {err:.2e}")
 
     def __call__(self, x: np.ndarray) -> float:

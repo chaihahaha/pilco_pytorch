@@ -207,7 +207,7 @@ $\phi_n,\Psi_{ef},M,\mathrm{Cov},C$ 的组装——**一行导数都没有**。
 就不能被当成常数**，它必须留在图里（否则梯度会漏掉
 $\partial A^{-1}/\partial\text{hyp} = -A^{-1}(\partial A)A^{-1}$ 这一项）。
 
-`pilco_pytorch` 的处理（`GpDynamicsOp._solve_cache`）是：
+`pilco_pytorch` 的处理（`GpDynamicsOp.posterior()`）是：
 
 - 超参数**不需要**梯度时（策略优化阶段）：缓存分解，省掉 $O(n^3)$；
 - 超参数**需要**梯度时（GP 训练阶段）：旁路缓存，每次重算 Cholesky 并留在图里。

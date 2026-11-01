@@ -65,12 +65,12 @@ pilco/
     base.py       MomentOp protocol, Moments container, splice()
     fourier.py    sin/cos harmonics: gTrig + gSin/gSat in one abstraction
     policy.py     RBF controller (congp + gp2)
-    gp.py         ARD squared-exponential GP dynamics (gp0d)
+    gp.py         GP dynamics: GPyTorch model + uncertain-input moments (gp0d)
     cost.py       saturating cost (lossSat) + trig-augmented variant (loss_cp)
     joint.py      joint trig augmentation of two correlated states
   trajectory.py   StateSpec, PilcoModel, plan(), mean Jacobians
   objectives.py   value, cumulative-cost variance, information gain, acquisitions
-  models/gp.py    hyper-parameter training
+  models/gp.py    hyper-parameter training (LBFGS, or PILCO's minimise)
   pilco.py        the learning loop
   scenarios/      cartpole.py, mountaincar.py
 tests/            validation against the NumPy reference and Monte Carlo
@@ -98,6 +98,41 @@ cov[:, out_idx] = proj; cov[out_idx, :] = proj.T; cov[out_idx, out_idx] = res.co
 
 That is the whole of `base/propagated.py::_fill_in` plus its cross-covariance
 bookkeeping, without the Fortran index gymnastics.
+
+### `ops/gp.py` — GPyTorch does the GP, this module does the moments
+
+The GP is a `ModuleList` of `gpytorch.models.ExactGP`, one per output dimension,
+each with a zero mean and `ScaleKernel(RBFKernel(ard_num_dims=d))`.  GPyTorch
+therefore owns the kernel, the likelihood, the marginal likelihood and the
+parameter containers; the module adds the one thing GPyTorch does not do — the
+moment-matched prediction at an *uncertain* input (`moments`, §1).
+
+Three details are easy to get wrong and are documented in the module itself:
+
+1. **Log parameterisation.**  GPyTorch maps its unconstrained `raw_*` parameters
+   to positive values with **softplus**.  PILCO optimises in log space, and the
+   learning loop's behaviour — including the reproduction of the NumPy
+   reference — depends on those coordinates, so the constraint is replaced by
+   `exp`/`log`: `constraints.Positive(transform=torch.exp, inv_transform=torch.log)`.
+   With it, `raw_lengthscale` *is* `log(ell)`.
+2. **Factors of two.**  GPyTorch stores *variances* (`outputscale`,
+   `likelihood.noise`) where PILCO stores *standard deviations*, so
+   `raw_outputscale == 2 log(sf)` and `raw_noise == 2 log(sigma_n)`.  The
+   `log_signal` / `log_noise` properties undo this, which is why the rest of the
+   package still sees PILCO's `(d + 2, E)` layout.
+3. **Per-datapoint MLL.**  `gpytorch.mlls.ExactMarginalLogLikelihood` returns
+   the log likelihood divided by the number of data points; `nlml()` multiplies
+   it back by `n`.
+
+What this removed: a hand-written Gram matrix, a jittered Cholesky, a
+log-determinant, an inverse, `beta`, and a cache keyed on a checksum of the
+hyper-parameters.  What replaced them: `covar_module`, `likelihood`,
+`ExactMarginalLogLikelihood`, and a cache whose invalidation rule is
+"do any hyper-parameters require a gradient?" (`posterior`).
+
+The **moments** are unchanged and still validated against `gp/gp0d.py` at
+1e-11 — GPyTorch has no uncertain-input prediction, which is the whole reason
+this module exists.
 
 ### `ops/fourier.py` — one abstraction for four operators
 
@@ -221,7 +256,7 @@ NumPy original, and checks the autograd gradient against finite differences).
    gradient checkpointing, or a custom backward would cut memory and may help
    speed; none is used.
 2. **No reuse of the GP factorisation between value and gradient.**
-   `_solve_cache` has to be bypassed whenever the hyper-parameters require grad
+   `posterior()` has to be bypassed whenever the hyper-parameters require grad
    (otherwise the cache would hold a graph), so training recomputes
    `cholesky(A)` per evaluation.  PILCO's `hypCurb` avoided this by hand-writing
    the derivative.  A `torch.autograd.Function` with a cached factorisation would
@@ -539,6 +574,26 @@ Across seeds (`results/cartpole_faithful_seeds.json`):
 | 1 | 38.3 | 35.1 | 33.3 | 30.2 | 26.9 | 19.5 |
 | 2 | 34.8 | 29.3 | 14.4 | 12.7 | 12.0 | **11.6** |
 | NumPy reference (faithful protocol) | 76.2 | 12.6 | 8.6 | 8.4 | 12.8 | — |
+
+> **Path sensitivity — measured, and it is large.**  Every number in this
+> section was recorded with the hand-written NLML.  After moving the GP to
+> GPyTorch (§2) the same protocol, same seed, gives
+>
+> | episode | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+> | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+> | before | 37.92 | 28.03 | 14.46 | 14.01 | 13.79 | 12.94 | 12.91 | 12.79 |
+> | after  | 38.16 | 27.93 | 30.99 | 18.20 | 15.54 | 15.68 | 15.71 | 14.97 |
+>
+> The GP operator itself is unchanged: `moments` agrees with the pre-refactor
+> implementation to **1e-20** on identical inputs, and the NLML to **1e-10**.
+> Neither is a behavioural change — BFGS amplifies a 1e-10 difference in the fit
+> into a different line-search decision, and by episode 3 the two loops are on
+> different policies.  The refactored loop still converges, to ~15.5 instead of
+> ~12.8, i.e. inside the seed-to-seed spread already recorded above (seed 2
+> settles at ~16.7).  Two conclusions: the *shape* of these tables is the result
+> and the exact values are one draw from a chaotic loop; and the dominant source
+> of variance in the closed loop is the optimiser path, not the model's accuracy —
+> which is exactly what §8 argued.
 
 Twelve episodes (`results/cartpole_faithful_12ep.json`):
 

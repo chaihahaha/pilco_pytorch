@@ -106,7 +106,7 @@ def main() -> int:
         op2 = GpDynamicsOp.from_log_hyp(torch.as_tensor(X), torch.as_tensor(Y),
                                         torch.as_tensor(lh))
         evals = {"n": 0}
-        params = [op2.log_lengthscales, op2.log_signal, op2.log_noise]
+        params = op2.hyperparameters()
         opt = torch.optim.LBFGS(params, lr=1.0, max_iter=iters,
                                 tolerance_grad=1e-10, tolerance_change=1e-14,
                                 line_search_fn="strong_wolfe")
@@ -135,7 +135,7 @@ def main() -> int:
     for iters in (150,):
         o = GpDynamicsOp.from_log_hyp(torch.as_tensor(X), torch.as_tensor(Y),
                                       torch.as_tensor(lh))
-        params = [o.log_lengthscales, o.log_signal, o.log_noise]
+        params = o.hyperparameters()
         opt = torch.optim.LBFGS(params, lr=1.0, max_iter=iters,
                                 tolerance_grad=1e-10, tolerance_change=1e-14,
                                 line_search_fn="strong_wolfe")

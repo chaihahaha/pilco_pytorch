@@ -1,56 +1,65 @@
 """GP dynamics as a closed-form moment-matching operator.
 
-This is the PyTorch replacement for ``gp/gp0d.py`` (full GP), ``gp/gp1d.py``
-(FITC sparse GP) and every ``dMdm/dSdm/dVdm/dMds/...`` derivative the original
-files hand-code.  Only the forward moments are written down; autograd supplies
-all derivatives, including the second-order ones.
+The model is **GPyTorch**: one :class:`gpytorch.models.ExactGP` per output
+dimension, each with a zero mean and an ARD squared-exponential kernel.  GPyTorch
+owns the kernel, the likelihood, the marginal likelihood and the parameter
+bookkeeping; this module adds the one thing GPyTorch does not do -- the
+**moment-matched prediction at an uncertain input**.
 
 Model
 -----
-``E`` independent GPs share inputs ``X`` (training states+controls) and have
-per-output ARD squared-exponential kernels::
+``E`` independent GPs share inputs ``X`` and have per-output ARD kernels::
 
     k_e(x, x') = sf_e^2 exp(-1/2 sum_d (x_d - x'_d)^2 / ell_{e,d}^2)
     A_e        = K_e + sigma_{n,e}^2 I
     beta_e     = A_e^{-1} Y_e
 
-Predictive moments at an uncertain input ``x ~ N(m, S)`` (PILCO eq. 2.34,
-``gp/gp0d.py``):
+Predictive moments at ``x ~ N(m, S)`` (PILCO eq. 2.34, ``gp/gp0d.py``):
 
-* ``ell_e[n]    = E[k_e(x, X_n)]``                         (Gaussian integral)
-* ``M_e         = beta_e^T ell_e``
-* ``L_ef[n,n']  = E[k_e(x, X_n) k_f(x, X_n')]``
+* ``phi_e[n]    = E[k_e(x, X_n)]``                       (Gaussian integral)
+* ``M_e         = beta_e^T phi_e``
+* ``Psi_ef[n,m] = E[k_e(x, X_n) k_f(x, X_m)]``
 * ``Cov[f_e, f_f] = delta_ef sf_e^2
-                    - delta_ef tr(A_e^{-1} L_ee)
-                    + beta_e^T (L_ef - ell_e ell_f^T) beta_f``
-* ``C_e = S^{-1} Cov[x, f_e] = -iL_e B_e^{-1} (iL_e g_e)``
-  with ``B_e = I + iL_e S iL_e``, ``iL_e = diag(1/ell_e)`` and
-  ``g_e = sum_n beta_{e,n} ell_{e,n} (m - X_n)``.
+                    - delta_ef tr(A_e^{-1} Psi_ee)
+                    + beta_e^T (Psi_ef - phi_e phi_f^T) beta_f``
+* ``C_e = S^{-1} Cov[x, f_e]``
 
 The ``delta_ef tr(...)`` term is absent for ``e != f`` because two different GPs
-are conditionally independent given their inputs; the correlation between the
-outputs is induced purely by the uncertainty about the shared input.
+are conditionally independent given their input; all output correlation comes
+from the uncertainty about that shared input.
 
-``L_ef`` derivation
--------------------
-The product of two squared-exponential kernels is again Gaussian in ``x``::
+Why GPyTorch here
+-----------------
+Everything *around* the moment integrals used to be hand-written: the Gram
+matrix, a jittered Cholesky, the log-determinant, the inverse, ``beta``, and a
+manual cache keyed on a checksum of the hyper-parameters.  All of that is now
+``covar_module``, ``likelihood`` and ``ExactMarginalLogLikelihood``, and the
+cache reduces to "does any hyper-parameter need a gradient?" -- see
+:meth:`posterior`.
 
-    k_e(x,X_n) k_f(x,X_n') = sf_e^2 sf_f^2 exp(-1/2 x^T A x + b^T x + c)
+Parameterisation
+----------------
+GPyTorch normally maps an unconstrained ``raw_*`` parameter to a positive value
+with **softplus**.  PILCO optimises in log space and the learning loop's
+behaviour (including the reproduction of the NumPy reference) depends on those
+coordinates, so the constraint is replaced by ``exp``/``log``.  Consequences:
 
-with ``A = L_e + L_f``, ``b = L_e X_n + L_f X_n'`` and
-``c = -1/2 (X_n^T L_e X_n + X_n'^T L_f X_n')``, so with
-``G = (I + S A)^{-1} S`` and ``d = L_e(X_n - m) + L_f(X_n' - m)``::
+===============  ============================  =============================
+quantity         GPyTorch raw parameter        relation to PILCO's ``hyp``
+===============  ============================  =============================
+lengthscale      ``raw_lengthscale`` (1, d)    ``raw == log(ell)``
+signal variance  ``raw_outputscale`` ()        ``raw == 2 log(sf)``
+noise variance   ``raw_noise`` (1,)            ``raw == 2 log(sigma_n)``
+===============  ============================  =============================
 
-    L_ef[n,n'] = sf_e^2 sf_f^2 |I + A S|^{-1/2}
-                 exp(k_n^e + k_n'^f + 1/2 d^T G d)
-
-which is exactly ``gp/gp0d.py``'s ``maha`` construction, written in the
-natural tensor notation instead of MATLAB/Octave index arithmetic.
+The factors of two are only there because GPyTorch stores *variances* where PILCO
+stores standard deviations; :attr:`log_signal` and :attr:`log_noise` undo them.
 """
 from __future__ import annotations
 
 from typing import Optional
 
+import gpytorch
 import torch
 import torch.nn as nn
 
@@ -59,22 +68,31 @@ from .base import MomentOp, Moments
 
 __all__ = ["GpDynamicsOp"]
 
+#: GPyTorch's default constraint is softplus; PILCO works in log coordinates.
+_LOG_POSITIVE = gpytorch.constraints.Positive(transform=torch.exp,
+                                              inv_transform=torch.log)
 
-def _robust_cholesky(a: torch.Tensor) -> torch.Tensor:
-    """Cholesky with progressive jitter (hyper-parameter steps can be wild)."""
-    eye = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
-    scale = torch.clamp(torch.diagonal(a).abs().max(), min=1.0)
-    last: Exception | None = None
-    for k in range(10):
-        try:
-            return torch.linalg.cholesky(a + scale * 1e-12 * 10 ** k * eye)
-        except RuntimeError as exc:  # pragma: no cover - numerical fallback
-            last = exc
-    raise RuntimeError("Gram matrix not factorisable") from last
+
+class _SingleOutputGP(gpytorch.models.ExactGP):
+    """``y = f(x) + eps`` with a zero mean and an ARD squared-exponential kernel."""
+
+    def __init__(self, inputs: torch.Tensor, targets: torch.Tensor):
+        super().__init__(inputs, targets,
+                         gpytorch.likelihoods.GaussianLikelihood(
+                             noise_constraint=_LOG_POSITIVE))
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=inputs.shape[1],
+                                       lengthscale_constraint=_LOG_POSITIVE),
+            outputscale_constraint=_LOG_POSITIVE)
+
+    def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+        return gpytorch.distributions.MultivariateNormal(
+            self.mean_module(x), self.covar_module(x))
 
 
 class GpDynamicsOp(MomentOp):
-    """Sum of ``E`` independent ARD squared-exponential GP regressors.
+    """``E`` independent ARD squared-exponential GP regressors, one per output.
 
     Parameters
     ----------
@@ -88,15 +106,16 @@ class GpDynamicsOp(MomentOp):
         ``(E,)`` signal standard deviations (not variances).
     noise:
         ``(E,)`` observation-noise standard deviations.
-    individual_noise:
-        Optional ``(n, E)`` per-datapoint noise VARIANCES (PILCO's ``nigp``),
-        used by the sparse/FITC variant.
+    share_lengthscales:
+        Share one ARD lengthscale across all outputs.  Off by default: PILCO uses
+        one per (input, output) pair, which is 24 parameters for cart-pole's 6
+        inputs and 4 outputs -- more than the number of data points in the first
+        episodes.  Measured to hurt; see ``docs/ARCHITECTURE.md`` section 8.
     """
 
     def __init__(self, inputs: torch.Tensor, targets: torch.Tensor,
                  lengthscales: torch.Tensor, signal: torch.Tensor,
                  noise: torch.Tensor,
-                 individual_noise: Optional[torch.Tensor] = None,
                  share_lengthscales: bool = False):
         super().__init__()
         inputs = torch.as_tensor(inputs)
@@ -104,42 +123,33 @@ class GpDynamicsOp(MomentOp):
         if inputs.ndim != 2 or targets.shape[0] != inputs.shape[0]:
             raise ValueError("inputs and targets must be (n, d) and (n, E)")
         d, E = inputs.shape[1], targets.shape[1]
-        ell = torch.as_tensor(lengthscales)
-        if ell.numel() == d:
-            ell = ell.reshape(d, 1).expand(d, E).clone()
-        else:
-            ell = ell.reshape(d, E).clone()
-        sig = torch.as_tensor(signal).reshape(-1)
-        noi = torch.as_tensor(noise).reshape(-1)
-        if sig.numel() == 1:
-            sig = sig.expand(E).clone()
-        if noi.numel() == 1:
-            noi = noi.expand(E).clone()
-
         self.n_in, self.n_out = d, E
-        #: When true, one ARD lengthscale per input dimension is shared by all
-        #: outputs, halving-ish the hyper-parameter count.  PILCO uses one per
-        #: (input, output) pair, which is 24 parameters for cart-pole's 6 inputs
-        #: and 4 outputs -- more than the number of data points in the first
-        #: episodes.  See ``docs/ARCHITECTURE.md`` section 8.
         self.share_lengthscales = bool(share_lengthscales)
-        if self.share_lengthscales:
-            ell = ell[:, :1]
+
         self.register_buffer("inputs", inputs.clone())
         self.register_buffer("targets", targets.clone())
-        self.log_lengthscales = nn.Parameter(torch.log(ell.clone()))
-        self.log_signal = nn.Parameter(torch.log(sig.clone()))
-        self.log_noise = nn.Parameter(torch.log(noi.clone()))
-        if individual_noise is None:
-            individual_noise = torch.zeros_like(targets)
-        self.register_buffer("individual_noise", individual_noise.clone())
-        self._cache: dict = {}
+        self.models = nn.ModuleList(
+            [_SingleOutputGP(self.inputs, self.targets[:, e]) for e in range(E)])
+        if self.share_lengthscales:
+            kernel = self.models[0].covar_module.base_kernel
+            for model in self.models[1:]:
+                model.covar_module.base_kernel = kernel
 
+        ell = torch.as_tensor(lengthscales).reshape(d, -1)
+        ell = ell.expand(d, E) if ell.shape[1] == 1 else ell
+        self.invalidate_cache()
+        self.set_log_hyp(torch.cat([
+            torch.log(ell),
+            torch.log(torch.as_tensor(signal).reshape(1, -1).expand(1, E)),
+            torch.log(torch.as_tensor(noise).reshape(1, -1).expand(1, E)),
+        ], dim=0))
+
+    # ------------------------------------------------------------------
+    # construction / hyper-parameter plumbing
     # ------------------------------------------------------------------
     @classmethod
     def from_log_hyp(cls, inputs: torch.Tensor, targets: torch.Tensor,
                      log_hyp: torch.Tensor,
-                     individual_noise: Optional[torch.Tensor] = None,
                      share_lengthscales: bool = False) -> "GpDynamicsOp":
         """Build from PILCO's hyper-parameter layout ``(d + 2, E)``.
 
@@ -150,7 +160,6 @@ class GpDynamicsOp(MomentOp):
         d = log_hyp.shape[0] - 2
         return cls(inputs, targets, torch.exp(log_hyp[:d]),
                    torch.exp(log_hyp[d]), torch.exp(log_hyp[d + 1]),
-                   individual_noise=individual_noise,
                    share_lengthscales=share_lengthscales)
 
     def set_log_hyp(self, value: torch.Tensor) -> None:
@@ -161,28 +170,49 @@ class GpDynamicsOp(MomentOp):
         value = torch.as_tensor(value)
         d = self.n_in
         with torch.no_grad():
-            if self.share_lengthscales:
-                self.log_lengthscales.copy_(value[:d, :1])
-            else:
-                self.log_lengthscales.copy_(value[:d])
-            self.log_signal.copy_(value[d])
-            self.log_noise.copy_(value[d + 1])
+            for e, model in enumerate(self.models):
+                if e == 0 or not self.share_lengthscales:
+                    model.covar_module.base_kernel.raw_lengthscale.copy_(
+                        value[:d, e].reshape(1, -1))
+                model.covar_module.raw_outputscale.copy_(2.0 * value[d, e])
+                model.likelihood.raw_noise.copy_(
+                    (2.0 * value[d + 1, e]).reshape(1))
         self.invalidate_cache()
 
     def log_hyp(self) -> torch.Tensor:
         """The hyper-parameters in PILCO's ``(d + 2, E)`` layout."""
-        ell = self.log_lengthscales
-        if self.share_lengthscales:
-            ell = ell.expand(self.n_in, self.n_out)
-        return torch.cat([ell, self.log_signal[None, :],
-                          self.log_noise[None, :]], dim=0)
+        return torch.cat([self.log_lengthscales, self.log_signal[None],
+                          self.log_noise[None]], dim=0)
 
-    # ------------------------------------------------------------------
+    def hyperparameters(self) -> list[torch.Tensor]:
+        """The leaf tensors the learning loop optimises (deduplicated)."""
+        out: list[torch.Tensor] = []
+        for model in self.models:
+            for p in (model.covar_module.base_kernel.raw_lengthscale,
+                      model.covar_module.raw_outputscale,
+                      model.likelihood.raw_noise):
+                if not any(p is q for q in out):
+                    out.append(p)
+        return out
+
+    # -- views on the GPyTorch parameters, in PILCO's coordinates -----------
     def _log_ell(self, e: int) -> torch.Tensor:
-        """Log lengthscales used for output ``e`` (shared or per-output)."""
-        if self.share_lengthscales:
-            return self.log_lengthscales[:, 0]
-        return self.log_lengthscales[:, e]
+        """Log lengthscales used for output ``e``."""
+        return self.models[e].covar_module.base_kernel.raw_lengthscale.reshape(-1)
+
+    @property
+    def log_lengthscales(self) -> torch.Tensor:
+        return torch.stack([self._log_ell(e) for e in range(self.n_out)], dim=1)
+
+    @property
+    def log_signal(self) -> torch.Tensor:
+        return 0.5 * torch.stack([m.covar_module.raw_outputscale.reshape(())
+                                  for m in self.models])
+
+    @property
+    def log_noise(self) -> torch.Tensor:
+        return 0.5 * torch.stack([m.likelihood.raw_noise.reshape(())
+                                  for m in self.models])
 
     @property
     def lengthscales(self) -> torch.Tensor:
@@ -196,172 +226,62 @@ class GpDynamicsOp(MomentOp):
     def noise(self) -> torch.Tensor:
         return torch.exp(self.log_noise)
 
-    def kernel(self, a: torch.Tensor, b: torch.Tensor, e: int) -> torch.Tensor:
-        """``k_e`` between rows of ``a`` and ``b``."""
-        iell = torch.exp(-self._log_ell(e))
-        dist = ((a[:, None, :] - b[None, :, :]) * iell) ** 2
-        return (self.signal[e] ** 2) * torch.exp(-0.5 * dist.sum(-1))
-
-    def gram(self, e: int) -> torch.Tensor:
-        """``K_e + sigma_e^2 I + diag(nigp_e)``."""
-        K = self.kernel(self.inputs, self.inputs, e)
-        eye = torch.eye(K.shape[0], dtype=K.dtype, device=K.device)
-        return K + (self.noise[e] ** 2) * eye + torch.diag(self.individual_noise[:, e])
-
-    def invalidate_cache(self) -> None:
-        """Drop cached Gram inverses (call after changing data or hyper-params)."""
-        self._cache = {}
-
-    def _solve_cache(self):
-        """Cache ``A_e^{-1}`` and ``beta_e``.
-
-        PILCO optimises the policy with the dynamics hyper-parameters held fixed,
-        so this cache is hit for the whole inner L-BFGS loop; it is invalidated
-        whenever the buffers or the log-hyper-parameters change.
-
-        When the hyper-parameters *do* require gradients the cache is bypassed:
-        caching graph-attached tensors would make the next ``backward()`` fail
-        with "trying to backward through the graph a second time", because the
-        cached sub-graph would be traversed twice.
-        """
-        needs_graph = (self.log_lengthscales.requires_grad
-                       or self.log_signal.requires_grad
-                       or self.log_noise.requires_grad)
-        if needs_graph:
-            iK, beta = [], []
-            for e in range(self.n_out):
-                A = self.gram(e)
-                iK.append(torch.linalg.inv(A))
-                beta.append(torch.linalg.solve(A, self.targets[:, e]))
-            return torch.stack(iK), torch.stack(beta, dim=1)
-
-        key = (self.inputs.data_ptr(), self.targets.data_ptr(),
-               self.inputs.shape,
-               float(self.log_signal.sum()) + float(self.log_noise.sum())
-               + float(self.log_lengthscales.sum()))
-        cached = self._cache.get("key")
-        if cached == key and "iK" in self._cache:
-            return self._cache["iK"], self._cache["beta"]
-        iK, beta = [], []
-        with torch.no_grad():
-            for e in range(self.n_out):
-                A = self.gram(e)
-                iK.append(torch.linalg.inv(A))
-                beta.append(torch.linalg.solve(A, self.targets[:, e]))
-        iK = torch.stack(iK)
-        beta = torch.stack(beta, dim=1)
-        self._cache = {"key": key, "iK": iK, "beta": beta}
-        return iK, beta
-
+    # ------------------------------------------------------------------
+    # inference
     # ------------------------------------------------------------------
     def nlml(self) -> torch.Tensor:
-        """Negative log marginal likelihood summed over outputs.
+        """``-log p(Y | X)`` summed over outputs.
 
-        Replaces ``gp/hypCurb.py`` + its hand-written derivatives with plain
-        autograd.  The Cholesky factorisation is done with progressive jitter so
-        that an exploratory hyper-parameter step cannot abort training.
+        GPyTorch's ``ExactMarginalLogLikelihood`` returns the log likelihood
+        **per data point**, hence the factor ``n``.
         """
-        total = torch.zeros((), dtype=self.inputs.dtype)
         n = self.inputs.shape[0]
-        for e in range(self.n_out):
-            A = self.gram(e)
-            L = _robust_cholesky(A)
-            alpha = torch.cholesky_solve(self.targets[:, e].unsqueeze(-1), L).squeeze(-1)
-            total = total + 0.5 * (self.targets[:, e] @ alpha)
-            total = total + torch.log(torch.diagonal(L)).sum()
-            total = total + 0.5 * n * torch.log(torch.tensor(2 * torch.pi, dtype=A.dtype))
+        total = torch.zeros((), dtype=self.inputs.dtype)
+        for e, model in enumerate(self.models):
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
+            total = total - n * mll(model(self.inputs), self.targets[:, e])
         return total
 
+    def invalidate_cache(self) -> None:
+        """Drop the cached ``(A^{-1}, beta)`` (call after changing hyper-params)."""
+        self._cached: Optional[tuple] = None
+
+    def posterior(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(A_e^{-1}, beta_e = A_e^{-1} y_e)`` stacked over outputs.
+
+        PILCO optimises the policy with the dynamics hyper-parameters held fixed,
+        so this is cached for the whole inner optimisation loop.  When the
+        hyper-parameters *do* require gradients (GP training) the cache is
+        bypassed: a graph-attached tensor reused twice would make the second
+        ``backward()`` fail.
+        """
+        frozen = not any(p.requires_grad for p in self.hyperparameters())
+        if frozen and self._cached is not None:
+            return self._cached
+
+        n = self.inputs.shape[0]
+        eye = torch.eye(n, dtype=self.inputs.dtype, device=self.inputs.device)
+        inv, beta = [], []
+        for e, model in enumerate(self.models):
+            A = (model.covar_module(self.inputs).evaluate()
+                 + model.likelihood.noise * eye)
+            L = gpytorch.utils.cholesky.psd_safe_cholesky(A)
+            inv.append(torch.cholesky_inverse(L))
+            beta.append(torch.cholesky_solve(self.targets[:, e, None], L).squeeze(-1))
+        out = (torch.stack(inv), torch.stack(beta, dim=1))
+        if frozen:
+            self._cached = out
+        return out
+
     # ------------------------------------------------------------------
-    def moments_batched(self, mean: torch.Tensor, cov: torch.Tensor) -> Moments:
-        """Predictive moments at an uncertain input, fully batched (NOT USED).
-
-        Two levels of batching replace the nested Python loops (see the profile in
-        ``scripts/diagnostics/profile_hotspots.py``: this call is ~100% of a
-        planning step).
-
-        **Status: experimental, not used.**  Compared against ``gp/gp0d.py`` it
-        agrees only to ~1e-3 in the predictive covariance, where the loop version
-        (``moments``) agrees to ~1e-12, so it fails the validation the operators
-        are held to.  The individual pieces (``G``, ``d_e``, ``d_f``, the cross
-        term, ``L_ef`` for ``(0, 0)``) were each checked to 1e-13, so the
-        discrepancy is somewhere in the ``(E, E)`` assembly that was not tracked
-        down.  It is kept here because it is most of the way to a ~3x speedup of
-        the planner and someone with more time should finish it.
-        """
-        d, E = self.n_in, self.n_out
-        dtype, device = mean.dtype, mean.device
-        eye = torch.eye(d, dtype=dtype, device=device)
-        iK, beta = self._solve_cache()
-
-        iell = torch.exp(-self.log_lengthscales.transpose(0, 1))      # (E, d)
-        iell2 = iell ** 2
-        B = eye + iell[:, :, None] * iell[:, None, :] * cov[None]     # (E, d, d)
-        ytilde = (mean[None, None, :] - self.inputs[None, :, :]) * iell[:, None, :]
-        sol = torch.linalg.solve(B, ytilde.transpose(1, 2)).transpose(1, 2)
-        k_n = -0.5 * (ytilde * ytilde).sum(-1)                        # (E, n)
-        logdet_B = 2.0 * torch.log(
-            torch.diagonal(torch.linalg.cholesky(symmetrize(B)), dim1=-2, dim2=-1)
-        ).sum(-1)                                                     # (E,)
-        ell = (self.signal ** 2)[:, None] * torch.exp(
-            -0.5 * logdet_B[:, None] - 0.5 * (ytilde * sol).sum(-1))   # (E, n)
-        M = (beta.transpose(0, 1) * ell).sum(1)                       # (E,)
-
-        # R[e] = (X - m) L_e  ->  (E, n, d)
-        R = (self.inputs[None, :, :] - mean[None, None, :]) * iell2[:, None, :]
-
-        # ---- product-kernel means L_ef[x, y] = E[k_e(x,X) k_f(y,X)] --------
-        lam = iell2[:, None, :] + iell2[None, :, :]                   # (E, E, d)
-        # cov @ diag(lam): the diagonal multiplies the COLUMN index, i.e. the
-        # last axis here.  Getting this transposed was a real bug caught by
-        # the loop-vs-batched comparison.
-        A = eye[None, None] + cov[None, None, :, :] * lam[:, :, None, :]
-        G = torch.linalg.solve(A, cov[None, None].expand(E, E, d, d))
-        sqrt_lam = torch.sqrt(lam.clamp(min=0.0))
-        scaled = symmetrize(cov[None, None] * sqrt_lam[:, :, :, None]
-                            * sqrt_lam[:, :, None, :])                # (E, E, d, d)
-        _, log_norm = torch.linalg.slogdet(eye[None, None] + scaled)
-        log_norm = -0.5 * log_norm                                    # (E, E)
-
-        RG = torch.einsum("enp,efpq->efnq", R, G)                     # (E, E, n, d)
-        d_e = (RG * R[:, None, :, :]).sum(-1)                         # (E, E, n)
-        # d_f[e, f, m] = R_f[m] G_ef R_f[m].  Note that m must stay an OUTPUT
-        # index: writing this as an einsum "efnq,fmq->efn" silently sums over
-        # m instead, which produced a wildly wrong covariance.
-        d_f = (RG * R[None, :, :, :]).sum(-1)
-        cross = torch.einsum("efnq,fmq->efnm", RG, R)                 # (E, E, n, n)
-        quad = 0.5 * (d_e[:, :, :, None] + d_f[:, :, None, :] + 2.0 * cross)
-
-        sf2 = self.signal ** 2
-        exponent = (k_n[:, None, :, None] + k_n[None, :, None, :]
-                    + quad + log_norm[:, :, None, None])
-        Lmat = (sf2[:, None, None, None] * sf2[None, :, None, None]
-                * torch.exp(exponent))                                # (E, E, n, n)
-
-        pre = torch.einsum("ne,efnm,mf->ef", beta, Lmat, beta)
-        trace_term = torch.einsum("enn,efnn->ef", iK, Lmat)
-        pre = pre + torch.diag_embed(
-            sf2 - torch.diagonal(trace_term, dim1=0, dim2=1))
-        out_cov = symmetrize(pre) - torch.outer(M, M)
-
-        # ---- input-output regression matrix C_e ---------------------------
-        g = ((beta * ell.transpose(0, 1)).transpose(0, 1)[:, :, None]
-             * (mean[None, None, :] - self.inputs[None, :, :])).sum(1)  # (E, d)
-        cross_c = torch.linalg.solve(B, (iell * g).unsqueeze(-1)).squeeze(-1)
-        cross = (-iell * cross_c).transpose(0, 1)                     # (d, E)
-        return Moments(M, out_cov, cross)
-
+    # moment matching (the part GPyTorch does not provide)
+    # ------------------------------------------------------------------
     def moments(self, mean: torch.Tensor, cov: torch.Tensor) -> Moments:
-        """Predictive moments at an uncertain input (per-output / per-pair loop).
-
-        This is the *validated* implementation: it agrees with ``gp/gp0d.py`` to
-        ~1e-12.  :meth:`moments_batched` is a partially finished attempt to
-        replace the loops with batched linear algebra; see its docstring.
-        """
+        """Predictive moments at an uncertain input ``x ~ N(mean, cov)``."""
         d, E = self.n_in, self.n_out
         dtype, device = mean.dtype, mean.device
         eye = torch.eye(d, dtype=dtype, device=device)
-        iK, beta = self._solve_cache()
+        iK, beta = self.posterior()
 
         ell_cols, k_cols, iell_cols, B_cols = [], [], [], []
         for e in range(E):

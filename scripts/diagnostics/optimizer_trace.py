@@ -191,8 +191,7 @@ def main() -> int:
     trec = []
     params = [model.policy.centers, model.policy.targets,
               model.policy.log_lengthscales]
-    gp_params = [model.dynamics.log_lengthscales, model.dynamics.log_signal,
-                 model.dynamics.log_noise]
+    gp_params = model.dynamics.hyperparameters()
     for p in gp_params:
         p.requires_grad_(False)
     opt = torch.optim.LBFGS(params, lr=1.0, max_iter=args.iters,

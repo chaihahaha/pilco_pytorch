@@ -104,7 +104,7 @@ pilco/
     joint.py       joint trig augmentation of two correlated states
   trajectory.py  StateSpec, PilcoModel, plan()
   objectives.py  value, cumulative-cost variance, information gain, acquisitions
-  models/gp.py   L-BFGS hyper-parameter training (replaces train + hypCurb)
+  models/gp.py   hyper-parameter training (replaces train + hypCurb)
   pilco.py       the learning loop
   scenarios/     cartpole.py, mountaincar.py
 ```
@@ -237,6 +237,13 @@ by the same L-BFGS call as the cost.  See `docs/DIRECTED_EXPLORATION.md`.
 
 ## Requirements
 
-Python ≥ 3.10, `torch ≥ 2.0` (for `torch.func`), `numpy`, `scipy` (only for the
-true-environment ODE in the cart-pole scenario).  The reference-validation tests
-additionally need `../pilco_python` on the path.
+Python ≥ 3.10, `torch ≥ 2.0` (for `torch.func`), `gpytorch ≥ 1.11`,
+`numpy`, `scipy` (only for the true-environment ODE in the cart-pole scenario).
+The reference-validation tests additionally need `../pilco_python` on the path.
+
+GPyTorch supplies the GP itself — kernel, likelihood, marginal likelihood and
+parameter containers; `pilco/ops/gp.py` adds only the moment-matched prediction
+at an uncertain input, which GPyTorch does not provide.  See
+`docs/ARCHITECTURE.md` §2 for the three details that make the two agree
+(log-parameterisation via a custom constraint, the factors of two between
+standard deviations and variances, and GPyTorch's per-datapoint MLL).

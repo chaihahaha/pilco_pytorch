@@ -25,7 +25,7 @@ conda 环境里都没有 `gpflow`/`gpytorch`/`emukit`/`probnum`/`botorch` 的残
 
 ## 1. 候选清单
 
-### 1.1 GPyTorch —— 替掉"GP 模型层"
+### 1.1 GPyTorch —— 替掉"GP 模型层"（**已采用**，见 §3）
 
 你已经用过。它提供 `ExactGP`/`SingleTaskGP`、`RBFKernel(ard_num_dims=)`、
 `ScaleKernel`、`GaussianLikelihood`、`ExactMarginalLogLikelihood`，以及基于
@@ -37,6 +37,8 @@ conda 环境里都没有 `gpflow`/`gpytorch`/`emukit`/`probnum`/`botorch` 的残
 | 手写 Cholesky 缓存与抖动 | `pilco/ops/gp.py::_solve_cache`、`gaussian.py::safe_cholesky` |
 | 核函数实现 | `pilco/ops/gp.py::_log_ell`、`share_lengthscales` |
 | L-BFGS/curb 那段调参逻辑 | `models/gp.py::curbed_nlml`（curb 需要自己保留） |
+
+（上表是重构前的评估，§3 记录了实际删掉的东西。）
 
 **替不掉**：不确定输入下的矩（`ops/gp.py::moments`）。GPyTorch 只在确定点上求值。
 
@@ -139,19 +141,44 @@ ProbNum 把这件事抽象成 `filtsmooth` 的 transition + 高斯矩更新。
 
 ---
 
-## 3. 如果只做一件事
+## 3. 本次重构做了什么（已实施）
 
-按"改动量 ÷ 收益"排序：
+按"改动量 ÷ 收益"选了第 1 条：**GP 模型层换成 GPyTorch**，矩匹配的数学原样保留。
 
-1. **换 GP 模型层为 GPyTorch**（低风险）：删掉 `models/gp.py` 的 NLML 与
-   `ops/gp.py::_solve_cache`，保留 `moments` 的数学，只把 `K`/`β` 的构造交给
-   `SingleTaskGP`。这一步能删约 200 行。
-2. **把 `ops/gp.py::moments` 换成 torchrl `GPWorldModel.uncertain_forward` 的移植**
-   （中风险）：能删掉最难的那 120 行，但要注意它输入是 state/action 分开的，
-   而 PILCO 需要 $[x,\sin,\cos,u]$ 的增广输入 —— 移植时要补一层投影。
-3. **不要**为了"简化"改用 MC-PILCO 的粒子路线再重跑 cartPole：本仓库的解析矩在
-   `n=320` 时耗 13.7 ms/步且精确到 $10^{-12}$，粒子法要在这个精度上需要
-   $O(10^6)$ 粒子。
+**删掉的**（这些是原本的"技术细节噪音"）：
+
+| 删掉 | 原来在哪 |
+| --- | --- |
+| 手写 Gram 矩阵 + 核函数 | `ops/gp.py::kernel` / `gram` |
+| 带抖动的 Cholesky（`_robust_cholesky`，11 行） | `ops/gp.py` |
+| 手写 log-det / inverse / `beta` / NLML（约 30 行） | `ops/gp.py::nlml` |
+| 以"超参之和"为键的手工缓存校验（40 行） | `ops/gp.py::_solve_cache` |
+| 每输出重复一遍的核 + Cholesky + NLML（35 行） | `models/gp.py::gp_nlml` / `curbed_gp_nlml` |
+| 未使用且只准到 1e-3 的批量实现（80 行死代码） | `ops/gp.py::moments_batched` |
+
+**换上的**：每输出一个 `gpytorch.models.ExactGP`
+（`ScaleKernel(RBFKernel(ard_num_dims=d))` + `GaussianLikelihood`）、
+`ExactMarginalLogLikelihood`、以及一条"超参需不需要梯度"的缓存规则
+（`ops/gp.py::posterior`）。
+
+**三个必须知道的对齐细节**（都写在 `ops/gp.py` 的模块 docstring 里）：
+
+1. GPyTorch 默认用 softplus 把 `raw_*` 映到正数；PILCO 在 log 空间优化，所以把约束
+   换成 `exp`/`log`（`constraints.Positive(transform=torch.exp, ...)`）。这样
+   `raw_lengthscale` 就是 `log(ell)`。
+2. GPyTorch 存的是**方差**（`outputscale`、`noise`），PILCO 存的是**标准差**，
+   所以 `raw_outputscale == 2 log(sf)`、`raw_noise == 2 log(sigma_n)`。
+3. `ExactMarginalLogLikelihood` 返回的是**每数据点**的对数似然，`nlml()` 要乘回 `n`。
+
+**效果**：`ops/gp.py` 416 → 340 行、`models/gp.py` 270 → 259 行（净 −87 行），
+但更重要的是**行数下降的地方全是数值细节**：剩下的是"*给定 $(m,S)$ 算三个矩*"
+这一件事，读者不需要再同时理解 Cholesky 抖动、行列式、逆矩阵和缓存键。
+
+**代价（必须诚实记录）**：矩的数值完全不变（与重构前逐元素差 $10^{-20}$，
+与 `gp0d.py` 差 $10^{-11}$），但 **NLML 变了 $10^{-10}$**，而闭环里的 `minimize`
+对 $10^{-10}$ 是混沌的——同样的协议从 `37.92 28.03 14.46` 变成
+`38.16 27.93 30.99`。所以旧的 episode 表不能再当作"逐位可复现"的证据，只能当作
+"同一个算法的另一次抽样"。这本身也说明：**闭环里真正的方差来源是优化路径，不是模型精度。**
 
 ---
 
@@ -163,3 +190,4 @@ ProbNum 把这件事抽象成 `filtsmooth` 的 transition + 高斯矩更新。
   - **GPflow `uncertain_conditional`**（TF，`expectation` 直接给 ψ0/ψ1/ψ2）。
 - 二者都只替掉 **GP 矩匹配**，都不管三角增广/饱和/代价/探索目标 —— 那部分是本仓库
   存在的理由。
+- **GPyTorch 已经在用**（第 3 节），它替掉的是 GP 的"基础设施"，不是矩匹配本身。

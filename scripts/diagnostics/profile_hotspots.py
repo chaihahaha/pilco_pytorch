@@ -118,8 +118,7 @@ def main() -> int:
     from pilco.optim.minimize import ParamVector, autograd_objective, minimize
     params = [model.policy.centers, model.policy.targets,
               model.policy.log_lengthscales]
-    for p in [model.dynamics.log_lengthscales, model.dynamics.log_signal,
-              model.dynamics.log_noise]:
+    for p in model.dynamics.hyperparameters():
         p.requires_grad_(False)
     vec = ParamVector(params)
     evaluate = autograd_objective(

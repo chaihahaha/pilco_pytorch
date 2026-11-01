@@ -208,8 +208,9 @@ def optimise_policy(model: PilcoModel, initial_state: Gaussian, config: PilcoCon
     """
     params = [model.policy.centers, model.policy.targets,
               model.policy.log_lengthscales]
-    gp_params = [model.dynamics.log_lengthscales, model.dynamics.log_signal,
-                 model.dynamics.log_noise]
+    # GPyTorch's raw parameters are the leaves; ``log_lengthscales`` and friends
+    # are views on them.
+    gp_params = model.dynamics.hyperparameters()
     for p in gp_params:
         p.requires_grad_(False)
 

@@ -31,7 +31,7 @@
 | $X\in\mathbb{R}^{n\times D}$ | 训练输入（堆成矩阵） | `inputs` |
 | $Y\in\mathbb{R}^{n\times E}$ | 训练目标 | `targets` |
 | $K$ | Gram 矩阵，$K_{ij}=k(X_i,X_j)$ | `K` |
-| $A$ | $K+\sigma_n^2 I$，加噪后的 Gram 矩阵 | `_solve_cache` 内部 |
+| $A$ | $K+\sigma_n^2 I$，加噪后的 Gram 矩阵 | GPyTorch 的 `covar_module` + `likelihood` |
 | $\beta$ | $A^{-1}Y$，**权重** | `beta` |
 | $\sigma_f$ | 信号标准差（核的幅度） | `signal` |
 | $\sigma_n$ | 观测噪声标准差 | `noise` |
@@ -263,7 +263,6 @@ $\mathrm{Cov}[x,x]$ 只有 $D(D+1)/2$ 个独立元素。但解析求导时，PIL
 
 需要算 $|A|$、$A^{-1}b$、$\log|A|$ 时，**永远不要**先求逆再乘，也**永远不要**用
 `det`。正确做法是 Cholesky 分解 $A=LL^\top$：
-
 $$
 |A| = \prod_i L_{ii}^2, \qquad
 \log|A| = 2\sum_i \log L_{ii}, \qquad
@@ -308,7 +307,6 @@ $\mathbb{E}[\cdot]$ 是对**初始状态的不确定性 + 过程噪声**取的�
 
 要算 $\mathbb{E}[c(x_1)]$ 其中 $x_1 = f(x_0,\pi(x_0))$ 且 $x_0\sim\mathcal{N}(m_0,S_0)$，
 你面对的是
-
 $$
 \int c\big(f(x,\pi(x))\big)\,\mathcal{N}(x;m_0,S_0)\,dx .
 $$
@@ -344,14 +342,12 @@ class MomentOp(nn.Module):
 
 给定真实的（非高斯）分布 $p$，我们想找最接近的高斯 $q=\mathcal{N}(\mu,\Sigma)$。
 "最接近"的判据是最小化 KL 散度：
-
 $$
 \mathrm{KL}\big(q\,\|\,p\big) = \int q(x)\log\frac{q(x)}{p(x)}dx .
 $$
 
 可以证明（本文不证）：在全体高斯分布里最小化 $\mathrm{KL}(q\|p)$，得到的
 $q$ 恰好满足
-
 $$
 \mu = \mathbb{E}_p[x], \qquad \Sigma = \mathrm{Cov}_p[x].
 $$
@@ -392,7 +388,6 @@ $$
 
 的意思是：随便挑有限个输入 $x_1,\dots,x_n$，函数值向量
 $\big(f(x_1),\dots,f(x_n)\big)$ 服从一个**联合高斯**，其均值为 0，协方差为
-
 $$
 \mathrm{Cov}\big[f(x_i),f(x_j)\big] = k(x_i,x_j).
 $$
@@ -429,7 +424,6 @@ $$
 
 给定数据 $\{(X_i,y_i)\}_{i=1}^n$，假设 $y_i = f(X_i)+\varepsilon_i$，
 $\varepsilon_i\sim\mathcal{N}(0,\sigma_n^2)$。那么
-
 $$
 \begin{bmatrix} Y \\ f(x_*) \end{bmatrix}
 \sim \mathcal{N}\!\left(
@@ -450,7 +444,7 @@ $$
 $$
 
 **所以 GP 回归就是一个 $n$ 维的高斯条件化，没有更多。** 代码里 $\beta$ 被缓存起来
-（`_solve_cache`），因为它在每个查询点都相同——这是把 $O(n^3)$ 的分解开销摊掉的
+（`GpDynamicsOp.posterior()` 的缓存），因为它在每个查询点都相同——这是把 $O(n^3)$ 的分解开销摊掉的
 关键。
 
 把 (3.2) 的均值写成"核值的线性组合"：
@@ -1247,7 +1241,7 @@ $n=30,D=3,E=2$，以"前向一次"为单位）：
 | --- | --- | --- |
 | (1.1) 二次型期望 | `cost.py::_e1` | `logdet(A)` + 解线性方程 |
 | (1.2) 带线性项 | `gp.py::moments` 的 `maha` 项 | $b=-\Lambda\delta$ |
-| (3.2) GP 预测 | `gp.py::_solve_cache` | $\beta=A^{-1}Y$ 缓存 |
+| (3.2) GP 预测 | `gp.py::posterior` | $\beta=A^{-1}Y$ 缓存 |
 | (3.4) 边缘似然 | `gp.py::nlml` | 三项：拟合/复杂度/常数 |
 | (4.1) $\phi_n$ | `gp.py::moments` 的 `ell` | 注意变量名叫 `ell` |
 | (4.2) $\Psi_{ef}$ | `gp.py::moments` 的 `L_mat` | `maha(ii,-ij,solve(R,s)/2)` |
