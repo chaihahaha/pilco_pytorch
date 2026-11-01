@@ -65,7 +65,6 @@ $S=S^\top$ 且 $v^\top S v\ge 0$。解析公式攒出来的 $S$ 会有 $10^{-16}
 **(3) `vec` 采用"列优先"（Fortran / MATLAB）顺序。** 当代码需要把矩阵摊平成向量
 （例如把 $\partial S/\partial s$ 写成一个 $E^2\times D^2$ 的 Jacobian）时，用的是
 MATLAB 的 `vec`：
-
 $$
 \mathrm{vec}(A)_{\,i + (j-1)M} \;=\; A_{ij}
 \qquad (A \text{ 是 } M\times N)
@@ -117,7 +116,6 @@ PILCO 的全部魔法来自一个事实：**高斯分布在两种操作下是封
 ### 1.2 两条基本法则
 
 **法则 A（仿射推送）。** 若 $x\sim\mathcal{N}(m,S)$，$y=Fx+b$，则
-
 $$
 \mathbb{E}[y] = Fm+b, \qquad \mathrm{Cov}[y] = F S F^\top .
 $$
@@ -130,7 +128,6 @@ S = symmetrize(A @ cov @ A.transpose(0, 1))
 ```
 
 **法则 B（条件化）。** 若
-
 $$
 \begin{bmatrix} x_a \\ x_b \end{bmatrix}
 \sim \mathcal{N}\!\left(\begin{bmatrix} m_a \\ m_b \end{bmatrix},
@@ -162,7 +159,6 @@ $$
 就这样，没有别的意思。“对 $b$ 积分掉”这个动作，就叫“对 $b$ 取边缘”。
 
 **高斯下这件事便宜到不需要积分。** 若
-
 $$
 \begin{bmatrix} a \\ b \end{bmatrix}
 \sim \mathcal{N}\!\left(\begin{bmatrix} m_a \\ m_b \end{bmatrix},
@@ -194,7 +190,6 @@ def marginal(self, idx):
 （§3.3），而"扔掉中间变量"用的是边缘化。
 
 **在 PILCO 里边缘化出现在哪。** `step_augmented()` 的中间结果是
-
 $$
 \big[\,x\ \big|\ \sin,\cos\ \big|\ u_{\text{raw}}\ \big|\ u\ \big|\ f(x,u)\,\big]
 $$

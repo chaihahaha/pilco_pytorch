@@ -18,6 +18,10 @@ formula↔code map at the end.
 [`docs/AUTOGRAD_VS_HAND_DERIVATIVES.md`](docs/AUTOGRAD_VS_HAND_DERIVATIVES.md)
 is the focused argument for which half of `gp0d.py`/`gp1d.py` autograd replaces
 and which half it cannot, with measurements.
+[`docs/LIBRARY_LANDSCAPE.md`](docs/LIBRARY_LANDSCAPE.md) surveys the off-the-shelf
+libraries (GPyTorch, TorchRL's `GPWorldModel`, GPflow's `uncertain_conditional`,
+Emukit quadrature, ProbNum, MC-PILCO) and says exactly which files each one would
+let you delete.
 
 ---
 
