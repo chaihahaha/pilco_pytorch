@@ -126,7 +126,10 @@ def main() -> int:
     max_c, max_m, max_s = 0.0, 0.0, 0.0
     for t in range(H):
         m, S = plant["prop"](m, S, plant, dm, pol)
-        c_np = float(cost["fcn"](cost, m, S)[0])
+        # NumPy >= 2.4 refuses float() on size-1 arrays, and lossSat returns a
+        # (1, 1) array, so squeeze explicitly rather than relying on the old
+        # implicit scalar conversion.
+        c_np = float(np.asarray(cost["fcn"](cost, m, S)[0]).reshape(-1)[0])
         c_t = float(traj.costs[t].detach())
         max_c = max(max_c, abs(c_np - c_t))
         max_m = max(max_m, float(np.abs(traj.states[t + 1].mean.detach().numpy() - m).max()))

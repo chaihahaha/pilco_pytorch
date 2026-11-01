@@ -9,6 +9,12 @@
 /dist/
 /envs/
 
+# 视频 / 动图
+*.mp4
+*.gif
+*.webm
+*.avi
+
 # 大文件 / 模型
 /models/
 /weights/

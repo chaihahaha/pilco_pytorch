@@ -10,6 +10,15 @@ directed-exploration design (and the diagnosis of why it does not help on
 cart-pole) is in [`docs/DIRECTED_EXPLORATION.md`](docs/DIRECTED_EXPLORATION.md)
 and in the repository-level [`reports/ANALYSIS.md`](../reports/ANALYSIS.md).
 
+**New to the maths?** [`docs/MATHEMATICS.md`](docs/MATHEMATICS.md) builds every
+formula this package uses from first principles — Gaussian closure, GP
+regression, the uncertain-input moment integrals, `splice`, the cost/variance
+algebra, the exploration criteria and the derivative conventions — with a
+formula↔code map at the end.
+[`docs/AUTOGRAD_VS_HAND_DERIVATIVES.md`](docs/AUTOGRAD_VS_HAND_DERIVATIVES.md)
+is the focused argument for which half of `gp0d.py`/`gp1d.py` autograd replaces
+and which half it cannot, with measurements.
+
 ---
 
 ## The idea in one paragraph
@@ -53,6 +62,10 @@ python scripts/run_cartpole.py --episodes 6 --seed 0
 # compare PILCO against the closed-form exploration objectives
 python scripts/benchmark_exploration.py --env cartpole --episodes 5 --seeds 0 1 2
 python scripts/benchmark_exploration.py --env mountaincar --episodes 4 --horizon 120
+
+# train, then render the learned swing-up (GIF + MP4 + a time-series figure)
+python scripts/make_animation.py --episodes 8 --seed 0
+python scripts/make_animation.py --no-train       # re-render from the cache
 ```
 
 Library use:
@@ -110,7 +123,9 @@ pilco/
 
 ## Status and a known limitation
 
-**The model layer is done and validated; the learning loop is not yet at parity.**
+**The model layer is done and validated, and the learning loop reproduces the
+reference's behaviour.**  The bullets below are kept as the record of how that
+was established, including the wrong turns.
 
 * All operators, the planner, the value and its gradient match the NumPy
   reference (table above).  On *identical* data and an identical starting policy
@@ -182,6 +197,25 @@ closely (bounded line searches / early stopping on the NLML, which is the
 behaviour the reference actually exhibits); (2) reduce the hyper-parameter count
 per output or share lengthscales until there are ≫ data points; (3) instrument
 the closed loop episode-by-episode against the reference on a *shared* dataset.
+
+## Watching it work
+
+`scripts/make_animation.py` trains the faithful protocol, caches the controller
+in `results/cartpole_swingup_policy.npz`, then renders
+
+* `results/cartpole_swingup.gif` / `.mp4` — the cart-pendulum in Cartesian space
+  with the pole-tip trail, `theta(t)` against the upright line, and the running
+  task cost;
+* `results/cartpole_swingup_timeseries.png` — the same information as a static
+  figure (`theta`, tip distance `d`, control `u`, cumulative cost);
+* `results/cartpole_swingup_summary.json` — the quantitative verdict
+  (`settled_upright`, time to within 20° of upright, tail angle error, clean and
+  noisy total cost).
+
+The animation uses the **true** dynamics (`solve_ivp`, RK45, `rtol=atol=1e-12`)
+with the learning loop's zero-order-hold control, integrated at `--substeps`
+finer resolution, and **no process noise**, so it shows the mean behaviour the
+controller was optimised for; the noisy cost is reported next to it.
 
 ## Directed exploration
 
